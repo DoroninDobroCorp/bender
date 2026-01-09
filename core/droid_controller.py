@@ -63,19 +63,14 @@ class DroidController:
             check=True
         )
         
-        # Перейти в директорию проекта
+        # Перейти в директорию проекта и запустить droid одной командой
+        # script -q /dev/null нужен для создания PTY (иначе droid не запускается)
+        start_cmd = f'cd {self.project_path} && script -q /dev/null {self.droid_binary}'
         subprocess.run(
-            ['tmux', 'send-keys', '-t', self.session_name, f'cd {self.project_path}', 'Enter'],
+            ['tmux', 'send-keys', '-t', self.session_name, start_cmd, 'Enter'],
             check=True
         )
-        await asyncio.sleep(1)
-        
-        # Запустить droid
-        subprocess.run(
-            ['tmux', 'send-keys', '-t', self.session_name, self.droid_binary, 'Enter'],
-            check=True
-        )
-        await asyncio.sleep(5)
+        await asyncio.sleep(8)
         
         # Обработать начальные диалоги (VSCode Extension и т.д.)
         initial_output = self._capture_pane()
@@ -142,6 +137,7 @@ class DroidController:
         initial_length = self.last_output_length
         last_timer = None
         timer_stable_count = 0
+        response_started = False
         
         while True:
             if time.time() - start_time > timeout:
@@ -149,6 +145,16 @@ class DroidController:
             
             current_output = self._capture_pane()
             self.last_output = current_output
+            
+            # Проверить начал ли Droid обрабатывать запрос
+            # Признаки: появился таймер [⏱ или символ ответа ⛬
+            if not response_started:
+                if '[⏱' in current_output or '⛬' in current_output:
+                    response_started = True
+                else:
+                    # Еще не начал - ждем
+                    await asyncio.sleep(self.check_interval)
+                    continue
             
             # Проверить активно ли выполняется команда
             is_executing = self._is_executing(current_output)
@@ -167,10 +173,17 @@ class DroidController:
                 stable_count = 0
                 timer_stable_count = 0
             
+            # Проверить есть ли пустой input prompt (готов к новому вводу)
+            has_empty_prompt = self._has_empty_input_prompt(current_output)
+            
             if current_output == last_output:
                 stable_count += 1
-                # 3 стабильных проверки, таймер не меняется, не в процессе выполнения
-                if stable_count >= 3 and (not current_timer or timer_stable_count >= 3) and not is_executing:
+                # Условия завершения:
+                # 1. Output стабилен (3 проверки)
+                # 2. Таймер не меняется (или его нет)
+                # 3. Не в процессе выполнения
+                # 4. Есть пустой input prompt (Droid готов к новому вводу)
+                if stable_count >= 3 and (not current_timer or timer_stable_count >= 3) and not is_executing and has_empty_prompt:
                     break
             else:
                 stable_count = 0
@@ -187,10 +200,46 @@ class DroidController:
         if current_length > initial_length:
             delta = current_output[initial_length:]
             self.last_output_length = current_length
-            return delta
         else:
             self.last_output_length = current_length
-            return current_output
+            delta = current_output
+        
+        # Droid использует TUI - ответ появляется в середине экрана
+        # Извлекаем ответ по маркеру ⛬
+        response_text = self._extract_response(current_output)
+        return response_text if response_text else delta
+    
+    def _extract_response(self, output: str) -> Optional[str]:
+        """Извлечь текст ответа Droid из TUI output
+        
+        Ответ Droid начинается с ⛬ и заканчивается перед UI элементами
+        """
+        # Ищем маркер ответа
+        marker = '⛬'
+        if marker not in output:
+            return None
+        
+        # Находим все ответы (может быть несколько в истории)
+        parts = output.split(marker)
+        if len(parts) < 2:
+            return None
+        
+        # Берем последний ответ
+        last_response = parts[-1]
+        
+        # Обрезаем UI элементы в конце (строки с │, ╭, ╰, режимы и т.д.)
+        lines = last_response.split('\n')
+        response_lines = []
+        for line in lines:
+            # Пропускаем UI элементы
+            if any(ui in line for ui in ['│', '╭', '╰', 'shift+tab', '? for help', 'IDE ◌', '[⏱', 'Auto (', 'Manual']):
+                continue
+            # Пропускаем пустые строки в конце
+            stripped = line.strip()
+            if stripped:
+                response_lines.append(line)
+        
+        return '\n'.join(response_lines).strip()
     
     def _capture_pane(self) -> str:
         """Захватить output из tmux pane"""
@@ -235,6 +284,20 @@ class DroidController:
         for pattern in patterns:
             if re.search(pattern, output, re.IGNORECASE):
                 return True
+        return False
+    
+    def _has_empty_input_prompt(self, output: str) -> bool:
+        """Проверить есть ли пустой input prompt (Droid готов к новому вводу)
+        
+        Ищем паттерн: │ >  (пустой prompt) или │ > │ в конце output
+        """
+        # Ищем строку с пустым prompt в последних 500 символах
+        tail = output[-500:] if len(output) > 500 else output
+        # Паттерн: │ > с пробелами до конца строки или до │
+        if re.search(r'│\s*>\s*│', tail):
+            return True
+        if re.search(r'│\s*>\s+$', tail, re.MULTILINE):
+            return True
         return False
     
     def has_approval_request(self) -> bool:

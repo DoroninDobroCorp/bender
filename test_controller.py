@@ -44,9 +44,9 @@ async def test_controller():
         
         # 3. Send simple command
         print("3. Sending test command...")
-        response = await controller.send("What is 2+2? Answer briefly.", timeout=30)
+        response = await controller.send("Say hello", timeout=60)
         print(f"   Response length: {len(response)} chars")
-        print(f"   Preview: {response[:200]}...\n" if len(response) > 200 else f"   Response: {response}\n")
+        print(f"   Preview: {response[:300]}...\n" if len(response) > 300 else f"   Response: {response}\n")
         
         # 4. Check approval request
         print("4. Checking approval request...")
