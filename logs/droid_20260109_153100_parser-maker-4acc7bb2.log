@@ -1,0 +1,118 @@
+=== DROID SESSION START ===
+Project: /Users/vladimirdoronin/VovkaNowEngineer/parser_maker
+Session: parser-maker-4acc7bb2
+
+Initial output:
+cd /Users/vladimirdoronin/VovkaNowEngineer/parser_maker
+droid
+vladimirdoronin@Vladimirs-MacBook-Pro parser_maker % cd /Users/vladimirdoronin/V
+ovkaNowEngineer/parser_maker
+vladimirdoronin@Vladimirs-MacBook-Pro parser_maker %
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+============================================================
+USER: What is 2+2? Answer briefly.
+============================================================
+
+DROID:
+ briefly
+.
+zsh: no matches found: 2+2?
+vladimirdoronin@Vladimirs-MacBook-Pro parser_maker %
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+============================================================
+NEW CHAT
+============================================================
+New chat opened:
+cd /Users/vladimirdoronin/VovkaNowEngineer/parser_maker
+droid
+vladimirdoronin@Vladimirs-MacBook-Pro parser_maker % cd /Users/vladimirdoronin/V
+ovkaNowEngineer/parser_maker
+vladimirdoronin@Vladimirs-MacBook-Pro parser_maker % What is 2+2? Answer briefly
+.
+zsh: no matches found: 2+2?
+vladimirdoronin@Vladimirs-MacBook-Pro parser_maker % /new
+zsh: no such file or directory: /new
+vladimirdoronin@Vladimirs-MacBook-Pro parser_maker %
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+============================================================
+SESSION END
+============================================================
+Final output:
+cd /Users/vladimirdoronin/VovkaNowEngineer/parser_maker
+droid
+vladimirdoronin@Vladimirs-MacBook-Pro parser_maker % cd /Users/vladimirdoronin/V
+ovkaNowEngineer/parser_maker
+vladimirdoronin@Vladimirs-MacBook-Pro parser_maker % What is 2+2? Answer briefly
+.
+zsh: no matches found: 2+2?
+vladimirdoronin@Vladimirs-MacBook-Pro parser_maker % /new
+zsh: no such file or directory: /new
+vladimirdoronin@Vladimirs-MacBook-Pro parser_maker %
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
