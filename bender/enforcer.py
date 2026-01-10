@@ -5,8 +5,11 @@ Task Enforcer - настаивает на завершении ТЗ
 После N неудач - эскалация к человеку.
 """
 
-from typing import Optional, List
+from typing import Optional, List, TYPE_CHECKING
 from dataclasses import dataclass
+
+if TYPE_CHECKING:
+    from .llm_router import LLMRouter
 
 
 @dataclass
@@ -32,7 +35,7 @@ class TaskEnforcer:
     def __init__(
         self,
         max_attempts: int = 5,
-        llm_router = None
+        llm_router: Optional["LLMRouter"] = None
     ):
         """
         Args:
@@ -40,7 +43,7 @@ class TaskEnforcer:
             llm_router: LLMRouter для генерации сообщений (опционально)
         """
         self.max_attempts = max_attempts
-        self.llm = llm_router
+        self.llm: Optional["LLMRouter"] = llm_router
         self._current_attempt = 0
     
     def enforce(
@@ -135,8 +138,9 @@ class TaskEnforcer:
             # Обрезать если слишком длинное
             if len(message) > 300:
                 message = message[:300] + "..."
-        except Exception:
-            # Fallback на шаблон
+        except Exception as e:
+            import logging
+            logging.getLogger(__name__).warning(f"LLM enforcement failed, using template: {e}")
             return self.enforce(missing_items, step_prompt, droid_response)
         
         return EnforcementResult(

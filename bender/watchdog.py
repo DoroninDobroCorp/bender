@@ -11,9 +11,13 @@ Watchdog - мониторинг здоровья Droid
 import asyncio
 import time
 import re
+import logging
 from typing import Optional, List, Callable, Awaitable
 from dataclasses import dataclass
 from enum import Enum
+
+
+logger = logging.getLogger(__name__)
 
 
 class HealthStatus(str, Enum):
@@ -47,24 +51,49 @@ class HealthCheck:
 class Watchdog:
     """Watchdog для мониторинга Droid"""
     
+    # Error patterns that indicate real problems (more specific to avoid false positives)
+    DEFAULT_ERROR_PATTERNS = [
+        r'^Traceback \(most recent call last\):',  # Python traceback start
+        r'\bpanic:\s',  # Go panic
+        r'^Unhandled\s+exception\s+in',  # Unhandled exception
+        r'^CRITICAL:\s',  # Critical log level
+        r'\bSegmentation fault\b',
+        r'\bSIGKILL\b',  # Signal kill
+        r'\bSIGSEGV\b',  # Segmentation fault signal
+        r'^Out of memory\b',
+        r'^MemoryError\b',  # Python memory error
+        r'^\s*Process\s+killed\s+by\s+signal',  # Process killed by signal
+    ]
+    
+    # Patterns that look like errors but are often normal operation
+    DEFAULT_FALSE_POSITIVE_PATTERNS = [
+        r'fatal: not a git repository',  # Normal git check
+        r'fatal: ambiguous argument',  # Git diff on new files
+        r'error: pathspec',  # Git checkout non-existent
+        r'npm WARN',  # npm warnings
+        r'warning:',  # General warnings
+        r'Error: ENOENT',  # File not found (often expected)
+        r'killed\s+successfully',  # Intentional kill
+        r'process\s+exited\s+with\s+code\s+0',  # Normal exit
+    ]
+    
     def __init__(
         self,
         check_interval: int = 300,      # 5 минут
         stuck_threshold: int = 3600,    # 1 час (12 проверок)
         loop_threshold: int = 3,        # 3 одинаковых сообщения
-        error_patterns: List[str] = None
+        error_patterns: Optional[List[str]] = None,
+        false_positive_patterns: Optional[List[str]] = None,
+        max_consecutive_errors: int = 3,
+        error_backoff_multiplier: float = 2.0
     ):
         self.check_interval = check_interval
         self.stuck_threshold = stuck_threshold
         self.loop_threshold = loop_threshold
-        self.error_patterns = error_patterns or [
-            r'Exception',
-            r'Error:',
-            r'FAILED',
-            r'Traceback',
-            r'panic:',
-            r'fatal:'
-        ]
+        self.error_patterns = error_patterns or self.DEFAULT_ERROR_PATTERNS
+        self.false_positive_patterns = false_positive_patterns or self.DEFAULT_FALSE_POSITIVE_PATTERNS
+        self.max_consecutive_errors = max_consecutive_errors
+        self.error_backoff_multiplier = error_backoff_multiplier
         
         # Состояние
         self._last_output: str = ""
@@ -72,6 +101,9 @@ class Watchdog:
         self._output_history: List[str] = []
         self._stuck_checks: int = 0
         self._running: bool = False
+        self._cleanup_callback: Optional[Callable[[], Awaitable[None]]] = None
+        self._consecutive_errors: int = 0
+        self._current_backoff: float = 0.0
     
     def check_health(
         self,
@@ -97,15 +129,25 @@ class Watchdog:
         
         # 2. Проверка ошибок в output
         for pattern in self.error_patterns:
-            if re.search(pattern, current_output, re.IGNORECASE):
-                return HealthCheck(
-                    status=HealthStatus.ERROR,
-                    action=WatchdogAction.NEW_CHAT,
-                    reason=f"Error detected: {pattern}",
-                    details=self._extract_error_context(current_output, pattern)
-                )
+            try:
+                if re.search(pattern, current_output, re.IGNORECASE | re.MULTILINE):
+                    # Check if it's a false positive
+                    is_false_positive = any(
+                        re.search(fp, current_output, re.IGNORECASE)
+                        for fp in self.false_positive_patterns
+                    )
+                    if not is_false_positive:
+                        return HealthCheck(
+                            status=HealthStatus.ERROR,
+                            action=WatchdogAction.NEW_CHAT,
+                            reason=f"Error detected: {pattern}",
+                            details=self._extract_error_context(current_output, pattern)
+                        )
+            except re.error as e:
+                logger.warning(f"Invalid regex pattern '{pattern}': {e}")
         
-        # 3. Проверка зацикливания
+        # 3. Проверка зацикливания (update history first, then check)
+        self._update_looping_history(current_output)
         if self._is_looping(current_output):
             return HealthCheck(
                 status=HealthStatus.LOOPING,
@@ -145,17 +187,18 @@ class Watchdog:
             reason="Droid is healthy"
         )
     
-    def _is_looping(self, current_output: str) -> bool:
-        """Проверить зацикливание"""
-        # Добавить в историю (последние 500 символов для сравнения)
+    def _update_looping_history(self, current_output: str):
+        """Update looping history only when output changes"""
         output_hash = current_output[-500:] if len(current_output) > 500 else current_output
         self._output_history.append(output_hash)
         
-        # Оставить только последние N записей
+        # Keep only last N+2 entries
         if len(self._output_history) > self.loop_threshold + 2:
             self._output_history = self._output_history[-(self.loop_threshold + 2):]
-        
-        # Проверить повторения
+    
+    def _is_looping(self, current_output: str) -> bool:
+        """Проверить зацикливание (checks existing history, doesn't add)"""
+        # Check if last N outputs are identical
         if len(self._output_history) >= self.loop_threshold:
             last_outputs = self._output_history[-self.loop_threshold:]
             if len(set(last_outputs)) == 1:
@@ -180,12 +223,15 @@ class Watchdog:
         self._last_output_time = time.time()
         self._output_history = []
         self._stuck_checks = 0
+        self._consecutive_errors = 0
+        self._current_backoff = 0.0
     
     async def start_monitoring(
         self,
         get_output: Callable[[], str],
         is_alive: Callable[[], bool],
-        on_issue: Callable[[HealthCheck], Awaitable[None]]
+        on_issue: Callable[[HealthCheck], Awaitable[None]],
+        on_cleanup: Optional[Callable[[], Awaitable[None]]] = None
     ):
         """Запустить фоновый мониторинг
         
@@ -193,21 +239,56 @@ class Watchdog:
             get_output: Функция получения текущего output
             is_alive: Функция проверки жива ли сессия
             on_issue: Callback при обнаружении проблемы
+            on_cleanup: Optional cleanup callback on shutdown
         """
         self._running = True
+        self._cleanup_callback = on_cleanup
         self.reset()
         
-        while self._running:
-            await asyncio.sleep(self.check_interval)
-            
-            if not self._running:
-                break
-            
-            check = self.check_health(get_output(), is_alive())
-            
-            if check.action != WatchdogAction.NONE:
-                await on_issue(check)
+        try:
+            while self._running:
+                # Apply backoff delay if we had consecutive errors
+                sleep_time = self.check_interval + self._current_backoff
+                try:
+                    await asyncio.sleep(sleep_time)
+                except asyncio.CancelledError:
+                    logger.debug("Watchdog monitoring cancelled")
+                    break
+                
+                if not self._running:
+                    break
+                
+                try:
+                    check = self.check_health(get_output(), is_alive())
+                    
+                    if check.action != WatchdogAction.NONE:
+                        await on_issue(check)
+                    
+                    # Reset error state on successful check
+                    self._consecutive_errors = 0
+                    self._current_backoff = 0.0
+                    
+                except Exception as e:
+                    self._consecutive_errors += 1
+                    logger.warning(f"Watchdog check error ({self._consecutive_errors}/{self.max_consecutive_errors}): {e}")
+                    
+                    # Apply exponential backoff
+                    if self._consecutive_errors >= self.max_consecutive_errors:
+                        self._current_backoff = min(
+                            self._current_backoff * self.error_backoff_multiplier if self._current_backoff > 0 else self.check_interval,
+                            self.check_interval * 10  # Max 10x normal interval
+                        )
+                        logger.warning(f"Watchdog backoff increased to {self._current_backoff:.1f}s")
+        finally:
+            # Cleanup on exit
+            self.reset()
+            if self._cleanup_callback:
+                try:
+                    await self._cleanup_callback()
+                except Exception as e:
+                    logger.warning(f"Watchdog cleanup error: {e}")
     
     def stop_monitoring(self):
         """Остановить мониторинг"""
         self._running = False
+        logger.debug("Watchdog stop requested")

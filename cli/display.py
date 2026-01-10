@@ -5,9 +5,13 @@ Visible: все детали, мысли Bender, output Droid
 Silent: только прогресс и результат
 """
 
+import logging
 from enum import Enum
-from typing import Optional
+from typing import Optional, Dict, Any
 import sys
+
+
+logger = logging.getLogger(__name__)
 
 
 class DisplayMode(str, Enum):
@@ -36,17 +40,22 @@ class Colors:
 
 
 class Display:
-    """Класс для вывода информации в терминал"""
+    """Класс для вывода информации в терминал с интеграцией logging"""
     
     def __init__(self, mode: DisplayMode = DisplayMode.VISIBLE, use_colors: bool = True):
         self.mode = mode
         self.use_colors = use_colors and sys.stdout.isatty()
+        self._logger = logging.getLogger("parser_maker.display")
     
     def _color(self, text: str, color: str) -> str:
         """Добавить цвет к тексту"""
         if not self.use_colors:
             return text
         return f"{color}{text}{Colors.RESET}"
+    
+    def _log_and_print(self, message: str, level: int = logging.INFO):
+        """Log message and print to console"""
+        self._logger.log(level, message.strip())
     
     def header(self, text: str):
         """Заголовок"""
@@ -56,6 +65,7 @@ class Display:
         print(self._color(f"  {text}", Colors.BOLD + Colors.CYAN))
         print(self._color(line, Colors.CYAN))
         print()
+        self._log_and_print(f"=== {text} ===")
     
     def separator(self):
         """Разделитель"""
@@ -64,42 +74,48 @@ class Display:
     def info(self, text: str):
         """Информационное сообщение"""
         print(self._color(f"  {text}", Colors.WHITE))
+        self._log_and_print(text)
     
     def success(self, text: str):
         """Успешное сообщение"""
         print(self._color(f"  ✓ {text}", Colors.GREEN))
+        self._log_and_print(f"SUCCESS: {text}")
     
     def warning(self, text: str):
         """Предупреждение"""
         print(self._color(f"  ⚠ {text}", Colors.YELLOW))
+        self._log_and_print(f"WARNING: {text}", logging.WARNING)
     
     def error(self, text: str):
         """Ошибка"""
         print(self._color(f"  ✗ {text}", Colors.RED))
+        self._log_and_print(f"ERROR: {text}", logging.ERROR)
     
     def progress(self, text: str):
         """Прогресс (показывается в обоих режимах)"""
         if self.mode == DisplayMode.SILENT:
-            # В silent режиме - краткий вывод
             print(self._color(f"→ {text}", Colors.DIM))
         else:
-            # В visible режиме - полный вывод
             print(self._color(f"  → {text}", Colors.BLUE))
+        self._log_and_print(f"PROGRESS: {text}", logging.DEBUG)
     
     def step_start(self, step_id: int, step_name: str):
         """Начало шага"""
         print()
         print(self._color(f"  Step {step_id}/6: {step_name}", Colors.BOLD + Colors.MAGENTA))
         print(self._color("  " + "-" * 40, Colors.DIM))
+        self._log_and_print(f"Step {step_id}/6: {step_name}")
     
     def step_complete(self, step_id: int, iterations: int):
         """Завершение шага"""
         print(self._color(f"  ✓ Step {step_id} complete ({iterations} iterations)", Colors.GREEN))
+        self._log_and_print(f"Step {step_id} complete ({iterations} iterations)")
     
     def iteration(self, step_id: int, iteration: int, confirmations: int):
         """Информация об итерации"""
         if self.mode == DisplayMode.VISIBLE:
             print(self._color(f"    Iteration {iteration}, confirmations: {confirmations}/2", Colors.DIM))
+        self._log_and_print(f"Step {step_id}, iteration {iteration}, confirmations: {confirmations}/2", logging.DEBUG)
     
     def droid_output(self, output: str, max_lines: int = 20):
         """Вывод от Droid (только в visible режиме)"""
@@ -120,6 +136,7 @@ class Display:
             return
         
         print(self._color(f"    🤖 Bender: {thought}", Colors.YELLOW))
+        self._log_and_print(f"Bender: {thought}", logging.DEBUG)
     
     def git_action(self, action: str):
         """Git действие"""
@@ -127,6 +144,7 @@ class Display:
             print(self._color(f"    📦 Git: {action}", Colors.BLUE))
         else:
             print(self._color(f"→ Git: {action}", Colors.DIM))
+        self._log_and_print(f"Git: {action}")
     
     def escalation(self, reason: str):
         """Эскалация к человеку"""
@@ -136,8 +154,9 @@ class Display:
         print(self._color(f"  {reason}", Colors.RED))
         print(self._color("  " + "!" * 60, Colors.BG_RED + Colors.WHITE))
         print()
+        self._log_and_print(f"ESCALATION: {reason}", logging.CRITICAL)
     
-    def final_report(self, stats: dict):
+    def final_report(self, stats: Dict[str, Any]):
         """Финальный отчет"""
         print()
         self.separator()
@@ -148,3 +167,4 @@ class Display:
             print(self._color(f"  {key}: {value}", Colors.WHITE))
         
         self.separator()
+        self._log_and_print(f"Final report: {stats}")

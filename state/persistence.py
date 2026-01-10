@@ -10,10 +10,48 @@ State Persistence - сохранение состояния pipeline
 
 import json
 import shutil
+import os
+import sys
 from pathlib import Path
 from datetime import datetime
 from typing import Optional, Dict, Any, List
 from dataclasses import dataclass, field, asdict
+from contextlib import contextmanager
+
+# Cross-platform file locking
+if sys.platform == 'win32':
+    import msvcrt
+    
+    @contextmanager
+    def _file_lock_impl(lock_path: Path):
+        """Windows file locking using msvcrt"""
+        lock_fd = None
+        try:
+            lock_fd = open(lock_path, 'w')
+            msvcrt.locking(lock_fd.fileno(), msvcrt.LK_NBLCK, 1)
+            yield
+        finally:
+            if lock_fd:
+                try:
+                    msvcrt.locking(lock_fd.fileno(), msvcrt.LK_UNLCK, 1)
+                except Exception:
+                    pass
+                lock_fd.close()
+else:
+    import fcntl
+    
+    @contextmanager
+    def _file_lock_impl(lock_path: Path):
+        """Unix file locking using fcntl"""
+        lock_fd = None
+        try:
+            lock_fd = os.open(str(lock_path), os.O_CREAT | os.O_RDWR)
+            fcntl.flock(lock_fd, fcntl.LOCK_EX)
+            yield
+        finally:
+            if lock_fd is not None:
+                fcntl.flock(lock_fd, fcntl.LOCK_UN)
+                os.close(lock_fd)
 
 
 @dataclass
@@ -71,14 +109,22 @@ class StatePersistence:
     
     STATE_FILE = "pipeline_state.json"
     BACKUP_DIR = "state_backups"
+    LOCK_FILE = ".state.lock"
     
     def __init__(self, state_dir: str):
         self.state_dir = Path(state_dir)
         self.state_dir.mkdir(parents=True, exist_ok=True)
         self.backup_dir = self.state_dir / self.BACKUP_DIR
-        self.backup_dir.mkdir(exist_ok=True)
+        self.backup_dir.mkdir(parents=True, exist_ok=True)
         
         self._state: Optional[PipelineStateData] = None
+        self._lock_file_path = self.state_dir / self.LOCK_FILE
+    
+    @contextmanager
+    def _file_lock(self):
+        """Context manager for file locking (cross-platform)"""
+        with _file_lock_impl(self._lock_file_path):
+            yield
     
     @property
     def state_file(self) -> Path:
@@ -116,43 +162,49 @@ class StatePersistence:
             self._state = PipelineStateData.from_dict(data)
             return self._state
         except Exception as e:
-            # Попробовать загрузить из backup
+            import logging
+            logging.getLogger(__name__).warning(f"Failed to load state file, trying backup: {e}")
             return self._load_from_backup()
     
     def save(self):
-        """Сохранить состояние (atomic write)"""
+        """Сохранить состояние (atomic write with file locking)"""
         if self._state is None:
             return
         
         self._state.updated_at = datetime.now().isoformat()
         
-        # Atomic write: сначала во временный файл
-        temp_file = self.state_file.with_suffix('.tmp')
-        
-        try:
-            with open(temp_file, 'w', encoding='utf-8') as f:
-                json.dump(self._state.to_dict(), f, indent=2, ensure_ascii=False)
+        with self._file_lock():
+            temp_file = self.state_file.with_suffix('.tmp')
+            backup_file = None
             
-            # Backup старого файла
-            if self.state_file.exists():
-                self._create_backup()
-            
-            # Переименовать temp в основной
-            temp_file.rename(self.state_file)
-            
-        except Exception as e:
-            if temp_file.exists():
-                temp_file.unlink()
-            raise
+            try:
+                # Write to temp file first
+                with open(temp_file, 'w', encoding='utf-8') as f:
+                    json.dump(self._state.to_dict(), f, indent=2, ensure_ascii=False)
+                    f.flush()
+                    os.fsync(f.fileno())
+                
+                # Create backup of existing state BEFORE replacing
+                if self.state_file.exists():
+                    backup_file = self._create_backup()
+                
+                # Atomic rename
+                temp_file.rename(self.state_file)
+                
+            except Exception:
+                # Cleanup temp file on failure
+                if temp_file.exists():
+                    temp_file.unlink()
+                raise
     
     def update(
         self,
-        current_step: int = None,
-        current_iteration: int = None,
-        confirmations: int = None,
-        status: str = None,
-        has_uncommitted_changes: bool = None,
-        recovery_stash: str = None
+        current_step: Optional[int] = None,
+        current_iteration: Optional[int] = None,
+        confirmations: Optional[int] = None,
+        status: Optional[str] = None,
+        has_uncommitted_changes: Optional[bool] = None,
+        recovery_stash: str = ...
     ):
         """Обновить состояние"""
         if self._state is None:
@@ -168,7 +220,7 @@ class StatePersistence:
             self._state.status = status
         if has_uncommitted_changes is not None:
             self._state.has_uncommitted_changes = has_uncommitted_changes
-        if recovery_stash is not None:
+        if recovery_stash is not ...:
             self._state.recovery_stash = recovery_stash
         
         self.save()
@@ -205,19 +257,30 @@ class StatePersistence:
         
         self.save()
     
-    def _create_backup(self):
-        """Создать backup текущего состояния"""
+    def _create_backup(self) -> Optional[Path]:
+        """Создать backup текущего состояния
+        
+        Returns:
+            Path to backup file, or None if no backup was created
+        """
         if not self.state_file.exists():
-            return
+            return None
         
         timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
         backup_file = self.backup_dir / f"state_{timestamp}.json"
-        shutil.copy2(self.state_file, backup_file)
+        try:
+            shutil.copy2(self.state_file, backup_file)
+        except OSError as e:
+            import logging
+            logging.getLogger(__name__).warning(f"Failed to create backup: {e}")
+            return None
         
         # Оставить только последние 10 backups
         backups = sorted(self.backup_dir.glob("state_*.json"))
         for old_backup in backups[:-10]:
-            old_backup.unlink()
+            old_backup.unlink(missing_ok=True)
+        
+        return backup_file
     
     def _load_from_backup(self) -> Optional[PipelineStateData]:
         """Загрузить из последнего backup"""
@@ -229,8 +292,12 @@ class StatePersistence:
             with open(backups[-1], 'r', encoding='utf-8') as f:
                 data = json.load(f)
             self._state = PipelineStateData.from_dict(data)
+            import logging
+            logging.getLogger(__name__).info(f"Loaded state from backup: {backups[-1].name}")
             return self._state
-        except Exception:
+        except Exception as e:
+            import logging
+            logging.getLogger(__name__).error(f"Failed to load from backup: {e}")
             return None
     
     def get_state(self) -> Optional[PipelineStateData]:

@@ -15,6 +15,11 @@ from dataclasses import dataclass
 logger = logging.getLogger(__name__)
 
 
+# Configurable timeouts
+GIT_COMMAND_TIMEOUT = 120  # 2 minutes for most commands
+GIT_PUSH_TIMEOUT = 300     # 5 minutes for push (large repos, slow networks)
+
+
 @dataclass
 class GitResult:
     """Результат git операции"""
@@ -30,25 +35,33 @@ class GitManager:
     def __init__(
         self,
         project_path: str,
-        auto_push: bool = True
+        auto_push: bool = True,
+        command_timeout: int = GIT_COMMAND_TIMEOUT,
+        push_timeout: int = GIT_PUSH_TIMEOUT,
+        dry_run: bool = False
     ):
         self.project_path = Path(project_path)
         self.auto_push = auto_push
+        self.command_timeout = command_timeout
+        self.push_timeout = push_timeout
+        self.dry_run = dry_run
         self._commit_count = 0
     
-    def _run_git(self, *args) -> Tuple[bool, str, str]:
+    def _run_git(self, *args, timeout: Optional[int] = None) -> Tuple[bool, str, str]:
         """Выполнить git команду"""
+        if timeout is None:
+            timeout = self.command_timeout
         try:
             result = subprocess.run(
                 ['git', *args],
                 cwd=self.project_path,
                 capture_output=True,
                 text=True,
-                timeout=60
+                timeout=timeout
             )
             return result.returncode == 0, result.stdout, result.stderr
         except subprocess.TimeoutExpired:
-            return False, "", "Git command timed out"
+            return False, "", f"Git command timed out after {timeout}s"
         except Exception as e:
             return False, "", str(e)
     
@@ -97,6 +110,22 @@ class GitManager:
                 message="No changes to commit"
             )
         
+        # Формируем commit message (sanitize summary)
+        safe_summary = summary.replace('"', "'").replace('\n', ' ')[:100] if summary else ""
+        commit_msg = f"Step {step_number}, iteration {iteration}"
+        if safe_summary:
+            commit_msg += f": {safe_summary}"
+        
+        # Dry run mode - just log what would happen
+        if self.dry_run:
+            logger.info(f"[DRY RUN] Would commit: {commit_msg}")
+            if self.auto_push:
+                logger.info("[DRY RUN] Would push to remote")
+            return GitResult(
+                success=True,
+                message=f"[DRY RUN] Would commit: {commit_msg}"
+            )
+        
         # git add .
         success, _, stderr = self._run_git('add', '.')
         if not success:
@@ -105,11 +134,6 @@ class GitManager:
                 message="Failed to stage changes",
                 error=stderr
             )
-        
-        # Формируем commit message
-        commit_msg = f"Step {step_number}, iteration {iteration}"
-        if summary:
-            commit_msg += f": {summary[:100]}"
         
         # git commit
         success, stdout, stderr = self._run_git('commit', '-m', commit_msg)
@@ -142,7 +166,7 @@ class GitManager:
     
     def _push(self) -> GitResult:
         """Выполнить git push"""
-        success, stdout, stderr = self._run_git('push')
+        success, stdout, stderr = self._run_git('push', timeout=self.push_timeout)
         
         if success:
             logger.info("Pushed to remote")
@@ -213,9 +237,24 @@ class GitManager:
         )
     
     def get_current_branch(self) -> str:
-        """Получить текущую ветку"""
+        """Получить текущую ветку
+        
+        Returns:
+            Branch name, or 'detached:SHORT_SHA' if in detached HEAD state
+        """
         success, stdout, _ = self._run_git('rev-parse', '--abbrev-ref', 'HEAD')
-        return stdout.strip() if success else "unknown"
+        if not success:
+            return "unknown"
+        
+        branch = stdout.strip()
+        if branch == "HEAD":
+            # Detached HEAD state - get short SHA instead
+            success, sha, _ = self._run_git('rev-parse', '--short', 'HEAD')
+            if success:
+                return f"detached:{sha.strip()}"
+            return "detached:unknown"
+        
+        return branch
     
     def get_last_commit(self) -> str:
         """Получить последний commit"""

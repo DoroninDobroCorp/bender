@@ -8,11 +8,15 @@ Recovery - восстановление после сбоев
 """
 
 import subprocess
+import logging
 from pathlib import Path
 from typing import Optional, Tuple
 from dataclasses import dataclass
 
 from .persistence import StatePersistence, PipelineStateData
+
+
+logger = logging.getLogger(__name__)
 
 
 @dataclass
@@ -108,10 +112,12 @@ class RecoveryManager:
         
         # Если есть recovery stash и нужно применить
         if info.has_stash and apply_stash:
-            success = self._pop_stash()
+            success, msg = self._pop_stash()
             if success:
                 self.persistence.update(recovery_stash=None)
-                return True, f"Applied stash: {info.stash_name}"
+                return True, msg
+            else:
+                return False, msg
         
         return True, "Ready to resume"
     
@@ -195,7 +201,11 @@ class RecoveryManager:
             return False
     
     def _check_recovery_stash(self) -> Tuple[bool, Optional[str]]:
-        """Проверить есть ли recovery stash"""
+        """Проверить есть ли recovery stash
+        
+        Returns:
+            (has_stash, stash_ref) - stash_ref is like 'stash@{0}'
+        """
         try:
             result = subprocess.run(
                 ['git', 'stash', 'list'],
@@ -207,10 +217,10 @@ class RecoveryManager:
             
             for line in result.stdout.split('\n'):
                 if self.STASH_PREFIX in line:
-                    # Извлечь имя stash
-                    parts = line.split(':')
-                    if len(parts) >= 2:
-                        return True, parts[-1].strip()
+                    # Extract stash reference (e.g., 'stash@{0}')
+                    stash_ref = line.split(':')[0].strip() if ':' in line else None
+                    if stash_ref:
+                        return True, stash_ref
             
             return False, None
         except Exception:
@@ -230,8 +240,87 @@ class RecoveryManager:
         except Exception:
             return False
     
-    def _pop_stash(self) -> bool:
-        """Применить последний stash"""
+    def _pop_stash(self, stash_ref: Optional[str] = None) -> Tuple[bool, str]:
+        """Применить recovery stash
+        
+        Args:
+            stash_ref: Specific stash reference (e.g., 'stash@{0}').
+                      If None, finds recovery stash automatically.
+        
+        Returns:
+            (success, message)
+        """
+        temp_stash_created = False
+        try:
+            # Find the correct stash if not specified
+            if stash_ref is None:
+                has_stash, stash_ref = self._check_recovery_stash()
+                if not has_stash or stash_ref is None:
+                    return False, "No recovery stash found"
+            
+            # First, check if working directory is clean
+            if self._has_uncommitted_changes():
+                logger.warning("Working directory has uncommitted changes, stashing them first")
+                temp_stash_created = self._stash_changes("temp_before_recovery")
+                if not temp_stash_created:
+                    return False, "Failed to stash current changes before recovery"
+            
+            # Try to apply the specific stash
+            result = subprocess.run(
+                ['git', 'stash', 'apply', stash_ref],
+                cwd=self.project_path,
+                capture_output=True,
+                text=True,
+                timeout=30
+            )
+            
+            if result.returncode != 0:
+                error_text = result.stderr.lower() + result.stdout.lower()
+                if 'conflict' in error_text:
+                    # Conflict detected - abort and restore
+                    logger.error(f"Stash apply conflict: {result.stderr}")
+                    subprocess.run(
+                        ['git', 'checkout', '--', '.'],
+                        cwd=self.project_path,
+                        capture_output=True,
+                        timeout=10
+                    )
+                    # Restore temp stash if we created one
+                    if temp_stash_created:
+                        self._restore_temp_stash()
+                    return False, f"Stash apply failed due to conflicts. Manual resolution required. Stash preserved: {stash_ref}"
+                
+                # Restore temp stash on other failures
+                if temp_stash_created:
+                    self._restore_temp_stash()
+                return False, f"Stash apply failed: {result.stderr}"
+            
+            # If apply succeeded, drop the specific stash
+            drop_result = subprocess.run(
+                ['git', 'stash', 'drop', stash_ref],
+                cwd=self.project_path,
+                capture_output=True,
+                text=True,
+                timeout=10
+            )
+            
+            if drop_result.returncode != 0:
+                logger.warning(f"Failed to drop stash {stash_ref}: {drop_result.stderr}")
+            
+            return True, f"Successfully applied stash: {stash_ref}"
+            
+        except subprocess.TimeoutExpired:
+            if temp_stash_created:
+                self._restore_temp_stash()
+            return False, "Stash operation timed out"
+        except Exception as e:
+            logger.error(f"Stash pop error: {e}")
+            if temp_stash_created:
+                self._restore_temp_stash()
+            return False, f"Stash operation failed: {e}"
+    
+    def _restore_temp_stash(self) -> bool:
+        """Restore temporary stash created before recovery attempt"""
         try:
             result = subprocess.run(
                 ['git', 'stash', 'pop'],
@@ -240,19 +329,24 @@ class RecoveryManager:
                 text=True,
                 timeout=30
             )
-            return result.returncode == 0
-        except Exception:
+            if result.returncode == 0:
+                logger.info("Restored temporary stash")
+                return True
+            logger.warning(f"Failed to restore temp stash: {result.stderr}")
+            return False
+        except Exception as e:
+            logger.error(f"Error restoring temp stash: {e}")
             return False
     
     def discard_stash(self) -> bool:
         """Отбросить recovery stash"""
-        has_stash, _ = self._check_recovery_stash()
-        if not has_stash:
+        has_stash, stash_ref = self._check_recovery_stash()
+        if not has_stash or stash_ref is None:
             return True
         
         try:
             result = subprocess.run(
-                ['git', 'stash', 'drop'],
+                ['git', 'stash', 'drop', stash_ref],
                 cwd=self.project_path,
                 capture_output=True,
                 text=True,

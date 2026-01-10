@@ -191,9 +191,10 @@ class BenderSupervisor:
         if analysis.action == AnalysisAction.CONTINUE:
             if not analysis.has_changes:
                 self._confirmations += 1
-            else:
-                # Несущественные изменения - не сбрасываем confirmations
-                pass
+            elif not analysis.changes_substantial:
+                # Minor changes (typos, formatting) also count toward confirmation
+                self._confirmations += 1
+            # Substantial changes reset confirmations (handled by NEW_CHAT action)
             
             self._failed_attempts = 0
             self.enforcer.reset()
@@ -267,10 +268,12 @@ class BenderSupervisor:
         )
     
     def stop_watchdog(self):
-        """Остановить watchdog"""
+        """Остановить watchdog с graceful shutdown"""
         self.watchdog.stop_monitoring()
         if self._watchdog_task:
             self._watchdog_task.cancel()
+            # Note: Task will be awaited in _cleanup() or garbage collected
+            self._watchdog_task = None
     
     @property
     def confirmations(self) -> int:

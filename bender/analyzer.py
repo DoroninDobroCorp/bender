@@ -9,9 +9,15 @@ Response Analyzer - анализ ответов Droid через Gemini
 
 import json
 import re
-from typing import Dict, Any, Optional
+import logging
+from typing import Dict, Any, Optional, List
 from dataclasses import dataclass
 from enum import Enum
+
+from .llm_router import LLMRouter
+
+
+logger = logging.getLogger(__name__)
 
 
 class AnalysisAction(str, Enum):
@@ -82,12 +88,63 @@ class ResponseAnalyzer:
 6. failed_attempts >= 5 → action="ESCALATE"
 """
     
-    def __init__(self, llm_router):
+    def __init__(
+        self,
+        llm_router: LLMRouter,
+        truncate_length: int = 3000,
+        truncate_start_ratio: float = 0.4
+    ):
         """
         Args:
             llm_router: LLMRouter для вызова Gemini/GLM
+            truncate_length: Max length for truncated text
+            truncate_start_ratio: Ratio of text to keep from start (rest from end)
         """
         self.llm = llm_router
+        self.truncate_length = truncate_length
+        self.truncate_start_ratio = truncate_start_ratio
+    
+    def _smart_truncate(self, text: str, max_len: Optional[int] = None) -> str:
+        """Smart truncation preserving start and end of text
+        
+        Preserves JSON blocks if they exist in the text.
+        """
+        if max_len is None:
+            max_len = self.truncate_length
+            
+        if len(text) <= max_len:
+            return text
+        
+        # Check if there's a JSON block we should preserve
+        json_match = re.search(r'```json\s*(\{.*?\})\s*```', text, re.DOTALL)
+        if json_match:
+            json_block = json_match.group(0)
+            if len(json_block) < max_len * 0.5:
+                # Preserve JSON block and truncate the rest
+                remaining = max_len - len(json_block) - 50
+                if remaining > 100:
+                    start_len = int(remaining * self.truncate_start_ratio)
+                    end_len = remaining - start_len
+                    
+                    # Find where JSON block is
+                    json_start = json_match.start()
+                    json_end = json_match.end()
+                    
+                    before = text[:json_start]
+                    after = text[json_end:]
+                    
+                    if len(before) > start_len:
+                        before = before[:start_len] + "\n... [truncated] ...\n"
+                    if len(after) > end_len:
+                        after = "\n... [truncated] ...\n" + after[-end_len:]
+                    
+                    return before + json_block + after
+        
+        # Standard truncation: keep start_ratio from start, rest from end
+        start_len = int(max_len * self.truncate_start_ratio)
+        end_len = max_len - start_len - 50  # 50 chars for separator
+        
+        return f"{text[:start_len]}\n\n... [truncated {len(text) - max_len} chars] ...\n\n{text[-end_len:]}"
     
     async def analyze(
         self,
@@ -134,7 +191,7 @@ class ResponseAnalyzer:
 {criteria_text if criteria_text else "Не указаны"}
 
 ОТВЕТ DROID:
-{droid_output[-2000:] if len(droid_output) > 2000 else droid_output}
+{self._smart_truncate(droid_output, max_len=3000)}
 
 Проанализируй и ответь JSON:
 ```json

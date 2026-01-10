@@ -10,7 +10,7 @@ Pipeline Orchestrator - координатор 6-шагового pipeline
 
 import asyncio
 import logging
-from typing import Optional, Callable, Awaitable, Dict, Any
+from typing import Optional, Callable, Awaitable, Dict, Any, Tuple, List
 from dataclasses import dataclass, field
 from enum import Enum
 from pathlib import Path
@@ -20,6 +20,8 @@ from .git_manager import GitManager, GitResult
 from core.droid_controller import DroidController
 from bender.supervisor import BenderSupervisor, SupervisorDecision
 from bender.analyzer import AnalysisAction
+from state.persistence import StatePersistence
+from state.recovery import RecoveryManager
 
 
 logger = logging.getLogger(__name__)
@@ -64,12 +66,16 @@ class PipelineConfig:
     """Конфигурация pipeline"""
     target_url: str = ""
     parse_target: str = ""
-    # Дополнительные переменные для промптов
     extra_vars: Dict[str, str] = field(default_factory=dict)
 
 
 class PipelineOrchestrator:
-    """Оркестратор 6-шагового pipeline"""
+    """Оркестратор 6-шагового pipeline
+    
+    Supports async context manager:
+        async with PipelineOrchestrator(...) as orchestrator:
+            await orchestrator.run()
+    """
     
     CONFIRMATIONS_REQUIRED = 2
     
@@ -81,9 +87,12 @@ class PipelineOrchestrator:
         steps_yaml: Optional[str] = None,
         auto_git_push: bool = True,
         display_mode: str = "visible",
-        escalate_after: int = 5
+        escalate_after: int = 5,
+        state_dir: Optional[str] = None,
+        droid_binary: str = "droid"
     ):
         self.project_path = Path(project_path)
+        self.droid_binary = droid_binary
         
         # Загрузить шаги
         self.step_config = load_steps(steps_yaml)
@@ -101,9 +110,15 @@ class PipelineOrchestrator:
             auto_push=auto_git_push
         )
         
+        # State persistence
+        self._state_dir = state_dir or str(self.project_path / "state")
+        self.persistence = StatePersistence(self._state_dir)
+        self.recovery = RecoveryManager(project_path, self._state_dir)
+        
         # Состояние
         self.state = PipelineState()
         self.config = PipelineConfig()
+        self._shutdown_requested = False
         
         # Callbacks
         self._on_step_complete: Optional[Callable[[int, StepState], Awaitable[None]]] = None
@@ -111,12 +126,39 @@ class PipelineOrchestrator:
         self._on_escalate: Optional[Callable[[str], Awaitable[None]]] = None
         self._on_progress: Optional[Callable[[str], None]] = None
     
+    async def __aenter__(self):
+        """Async context manager entry"""
+        return self
+    
+    async def __aexit__(self, exc_type, exc_val, exc_tb):
+        """Async context manager exit - cleanup resources"""
+        await self._cleanup()
+        return False
+    
+    async def _cleanup(self):
+        """Cleanup all resources"""
+        self._shutdown_requested = True
+        self.bender.stop_watchdog()
+        
+        # Close LLM clients
+        if hasattr(self.bender, 'llm') and self.bender.llm:
+            await self.bender.llm.close()
+        
+        # Stop droid
+        if self.droid and self.droid.is_running():
+            try:
+                await asyncio.wait_for(self.droid.stop(), timeout=10.0)
+            except asyncio.TimeoutError:
+                logger.warning("Droid stop timed out")
+            except Exception as e:
+                logger.warning(f"Error stopping droid: {e}")
+    
     def set_callbacks(
         self,
-        on_step_complete: Callable[[int, StepState], Awaitable[None]] = None,
-        on_pipeline_complete: Callable[[PipelineState], Awaitable[None]] = None,
-        on_escalate: Callable[[str], Awaitable[None]] = None,
-        on_progress: Callable[[str], None] = None
+        on_step_complete: Optional[Callable[[int, StepState], Awaitable[None]]] = None,
+        on_pipeline_complete: Optional[Callable[[PipelineState], Awaitable[None]]] = None,
+        on_escalate: Optional[Callable[[str], Awaitable[None]]] = None,
+        on_progress: Optional[Callable[[str], None]] = None
     ):
         """Установить callbacks"""
         self._on_step_complete = on_step_complete
@@ -138,14 +180,78 @@ class PipelineOrchestrator:
         self.config.parse_target = parse_target
         self.config.extra_vars = extra_vars
     
+    async def health_check(self) -> Tuple[bool, List[str]]:
+        """Pre-flight health check before starting pipeline
+        
+        Returns:
+            (success, list of issues)
+        """
+        issues = []
+        
+        # Check project path
+        if not self.project_path.exists():
+            issues.append(f"Project path does not exist: {self.project_path}")
+        
+        # Check git repo
+        if not self.git.is_git_repo():
+            issues.append("Project is not a git repository")
+        
+        # Check tmux available
+        import shutil
+        if not shutil.which('tmux'):
+            issues.append("tmux is not installed or not in PATH")
+        
+        # Check droid binary
+        if not shutil.which(self.droid_binary):
+            issues.append(f"droid binary '{self.droid_binary}' not found in PATH")
+        
+        # Check disk space (minimum 100MB free)
+        try:
+            import os
+            stat = os.statvfs(self.project_path)
+            free_bytes = stat.f_bavail * stat.f_frsize
+            free_mb = free_bytes / (1024 * 1024)
+            if free_mb < 100:
+                issues.append(f"Low disk space: {free_mb:.1f}MB free (minimum 100MB required)")
+        except Exception as e:
+            issues.append(f"Could not check disk space: {e}")
+        
+        # Check LLM connectivity (with timeout)
+        try:
+            test_response = await asyncio.wait_for(
+                self.bender.llm.generate("Say 'ok'", temperature=0),
+                timeout=30.0
+            )
+            if not test_response:
+                issues.append("LLM returned empty response")
+        except asyncio.TimeoutError:
+            issues.append("LLM connectivity check timed out (30s)")
+        except Exception as e:
+            issues.append(f"LLM connectivity failed: {e}")
+        
+        return len(issues) == 0, issues
+    
     async def run(self) -> PipelineState:
         """Запустить pipeline с первого шага"""
+        # Create new run in persistence
+        self.persistence.create_new_run(
+            project_path=str(self.project_path),
+            target_url=self.config.target_url,
+            parse_target=self.config.parse_target
+        )
         return await self.run_from_step(1)
     
     async def run_from_step(self, start_step: int) -> PipelineState:
         """Запустить pipeline с указанного шага"""
         self.state.status = PipelineStatus.RUNNING
         self.state.current_step = start_step
+        self._shutdown_requested = False
+        
+        # Update persistence
+        self.persistence.update(
+            current_step=start_step,
+            status="RUNNING"
+        )
         
         self._log_progress(f"Starting pipeline from step {start_step}")
         
@@ -155,6 +261,10 @@ class PipelineOrchestrator:
             
             # Выполнить шаги
             for step_id in range(start_step, self.step_config.total_steps + 1):
+                if self._shutdown_requested:
+                    logger.info("Shutdown requested, stopping pipeline")
+                    break
+                    
                 self.state.current_step = step_id
                 step = self.step_config.get_step(step_id)
                 
@@ -180,17 +290,26 @@ class PipelineOrchestrator:
             # Завершение
             if self.state.status == PipelineStatus.RUNNING:
                 self.state.status = PipelineStatus.COMPLETED
+                self.persistence.update(status="COMPLETED")
+                self.recovery.mark_pipeline_complete()
                 self._log_progress("Pipeline completed!")
             
             if self._on_pipeline_complete:
                 await self._on_pipeline_complete(self.state)
             
+        except asyncio.CancelledError:
+            logger.info("Pipeline cancelled")
+            self.state.status = PipelineStatus.PAUSED
+            self.persistence.update(status="PAUSED")
+            raise
         except Exception as e:
             logger.error(f"Pipeline error: {e}")
             self.state.status = PipelineStatus.FAILED
+            self.persistence.update(status="FAILED")
+            self.recovery.mark_pipeline_failed(str(e))
             raise
         finally:
-            await self._stop_droid()
+            await self._cleanup()
         
         return self.state
     
@@ -209,6 +328,9 @@ class PipelineOrchestrator:
         while not step_state.completed:
             step_state.iteration += 1
             self.state.total_iterations += 1
+            
+            # Save state before iteration (for recovery)
+            self.recovery.save_for_recovery(step.id, step_state.iteration)
             
             self._log_progress(f"  Iteration {step_state.iteration}, confirmations: {step_state.confirmations}/{self.CONFIRMATIONS_REQUIRED}")
             
@@ -257,6 +379,7 @@ class PipelineOrchestrator:
         logger.info(f"Decision: {decision.action} - {decision.reason}")
         
         if decision.action == "ESCALATE":
+            self.persistence.update(status="ESCALATED")
             if self._on_escalate:
                 await self._on_escalate(decision.reason)
             return "ESCALATE"
@@ -282,12 +405,27 @@ class PipelineOrchestrator:
                 summary=summary
             )
             
+            commit_hash = None
             if git_result.needs_human:
                 logger.warning(f"Git issue: {git_result.error}")
                 if self._on_escalate:
                     await self._on_escalate(f"Git error: {git_result.error}")
             else:
                 self.state.total_commits += 1
+                last_commit = self.git.get_last_commit()
+                if last_commit:
+                    parts = last_commit.split()
+                    commit_hash = parts[0] if parts else None
+            
+            # Log iteration with commit
+            self.recovery.mark_iteration_complete(
+                step_id=step.id,
+                iteration=step_state.iteration,
+                action="NEW_CHAT",
+                has_changes=True,
+                confirmations=step_state.confirmations,
+                commit_hash=commit_hash
+            )
             
             # Новый чат
             await self.droid.new_chat()
@@ -297,8 +435,18 @@ class PipelineOrchestrator:
             # Проверить confirmations
             step_state.confirmations = self.bender.confirmations
             
+            # Log iteration
+            self.recovery.mark_iteration_complete(
+                step_id=step.id,
+                iteration=step_state.iteration,
+                action="CONTINUE",
+                has_changes=decision.analysis.has_changes if decision.analysis else False,
+                confirmations=step_state.confirmations
+            )
+            
             if step_state.confirmations >= self.CONFIRMATIONS_REQUIRED:
                 self._log_progress(f"  Step {step.id} complete (2x confirmation)")
+                self.recovery.mark_step_complete(step.id)
                 return "NEXT_STEP"
             
             return "CONTINUE"
@@ -310,6 +458,7 @@ class PipelineOrchestrator:
         """Запустить Droid"""
         self.droid = DroidController(
             project_path=str(self.project_path),
+            droid_binary=self.droid_binary,
             log_dir=str(self.project_path / "logs")
         )
         await self.droid.start()
@@ -322,10 +471,8 @@ class PipelineOrchestrator:
         )
     
     async def _stop_droid(self):
-        """Остановить Droid"""
-        self.bender.stop_watchdog()
-        if self.droid and self.droid.is_running():
-            await self.droid.stop()
+        """Остановить Droid (deprecated, use _cleanup)"""
+        await self._cleanup()
     
     async def _handle_watchdog_issue(self, decision: SupervisorDecision):
         """Обработать проблему от watchdog"""
@@ -337,7 +484,7 @@ class PipelineOrchestrator:
                 await self._on_escalate(decision.reason)
         
         elif decision.action == "RESTART":
-            await self._stop_droid()
+            await self._cleanup()
             await asyncio.sleep(2)
             await self._start_droid()
         
