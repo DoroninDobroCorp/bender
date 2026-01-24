@@ -1,94 +1,132 @@
-# Parser Maker
+# Bender - AI Task Supervisor
 
-Автоматизация создания парсеров через LLM с 6-шаговым pipeline и supervisor Bender (Gemini).
+Bender супервайзер для AI CLI инструментов (copilot, droid, codex). Он не решает задачи сам, а следит чтобы их правильно выполнили старшие модели.
 
 ## Концепция
 
-Каждый парсер создаётся в 6 последовательных шагов. На каждом шаге:
-1. Bender даёт Droid ТЗ шага
-2. Droid работает и отвечает: "сделал изменения X, Y, Z" или "всё ок, ничего не менял"
-3. Bender анализирует ответ и решает что дальше
-
-**Правило перехода:** Droid должен **дважды подряд** сказать "всё ок, без существенных изменений" - тогда переходим на следующий шаг.
-
-**Git:** После каждой итерации с существенными изменениями - автоматический commit и push.
-
-## Роли
-
-| Компонент | Кто | Что делает |
-|-----------|-----|------------|
-| **Droid** | Factory Droid (дорогая модель) | Выполняет работу, сам говорит сделал ли изменения |
-| **Bender** | Gemini | Следит за Droid, анализирует ответы, помогает как программист |
-
-## Что делает Bender
-
-Bender - это программист-помощник на Gemini который:
-- **Следит** за здоровьем Droid (не завис? не зациклился? не вылетел?)
-- **Понимает** ответы Droid (были изменения? существенные? ТЗ выполнено?)
-- **Настаивает** на завершении ТЗ если Droid не закончил
-- **Помогает** если проблема (перезапуск, новый чат, пинок)
-- **Эскалирует** к человеку только в крайнем случае
+```
+Ты даёшь задачу → Bender анализирует сложность → Выбирает worker →
+→ Мониторит выполнение → Пинает если застрял → Проверяет результат
+```
 
 ## Быстрый старт
 
 ```bash
-# Установка
+# 1. Клонировать
+git clone https://github.com/DoroninDobroCorp/bender.git
+cd bender
+
+# 2. Установить зависимости
 pip install -r requirements.txt
+
+# 3. Настроить .env
 cp .env.example .env
-# Заполнить .env (GEMINI_API_KEY обязателен)
+# Заполнить GLM_API_KEY (Cerebras) и DROID_PROJECT_PATH
 
-# Запуск (visible mode - видно всё)
-parser-maker run /path/to/project
-
-# Запуск (silent mode - только прогресс)
-parser-maker run /path/to/project --silent
-
-# Продолжить после сбоя
-parser-maker resume
-
-# Статус
-parser-maker status
+# 4. Запустить
+python -m cli.main run "твоя задача"
 ```
 
-## Режимы отображения
+## Примеры
 
-### Visible (по умолчанию)
-Видно всё: мысли Bender, output Droid, git операции, решения.
+```bash
+# Авто-выбор worker'а по сложности
+python -m cli.main run "исправь опечатку в README"     # → droid (simple)
+python -m cli.main run "добавь unit тест для auth"     # → opus (medium)
+python -m cli.main run "добавь OAuth авторизацию"      # → codex (complex)
 
-### Silent
-Только прогресс: "Шаг 2/6, итерация 3" и финальный результат.
+# Принудительный выбор worker'а
+python -m cli.main run --droid "простая задача"
+python -m cli.main run --codex "сложная задача"
 
-## Документация
+# Простой режим (без анализа и верификации)
+python -m cli.main run --simple "echo hello"
 
-- [Архитектура](docs/ARCHITECTURE.md) - как устроена система, flow, компоненты
-- [Epics & Stories](docs/EPICS.md) - план разработки
+# Видимый режим (терминалы открыты для отладки)
+python -m cli.main run --visible "задача"
 
-## Конфигурация
+# Кастомный интервал проверки логов
+python -m cli.main run --interval 10 "задача"
+```
+
+## Как работает
+
+```
+┌─────────────────────────────────────────────────┐
+│  bender run "Добавь OAuth"                      │
+└───────────────────┬─────────────────────────────┘
+                    ▼
+┌─────────────────────────────────────────────────┐
+│  TaskClarifier (GLM)                            │
+│  • Анализ сложности: SIMPLE/MEDIUM/COMPLEX      │
+│  • Генерация acceptance criteria                │
+│  • Уточняющие вопросы если нужно                │
+└───────────────────┬─────────────────────────────┘
+                    ▼
+         ┌──────────┴──────────┐
+         ▼          ▼          ▼
+      SIMPLE     MEDIUM     COMPLEX
+       droid      opus       codex
+     (no verif)            (x2 interval)
+         │          │          │
+         └──────────┴──────────┘
+                    ▼
+┌─────────────────────────────────────────────────┐
+│  Мониторинг + NUDGE                             │
+│  • Захват логов каждые N секунд                 │
+│  • GLM анализирует: stuck/loop/completed        │
+│  • "Все пункты ТЗ выполнены?" если застрял      │
+│  • Restart только если сессия умерла            │
+└───────────────────┬─────────────────────────────┘
+                    ▼
+          [COMPLEX + много изменений?]
+                    │
+                    ▼
+           Codex final review
+           (поиск багов)
+```
+
+## Workers
+
+| Worker | CLI | Когда | Особенности |
+|--------|-----|-------|-------------|
+| **droid** | `droid` | Простые задачи | Без верификации |
+| **opus** | `copilot --allow-all-tools` | Основной режим | Полный цикл |
+| **codex** | `codex --dangerous-mode` | Сложные задачи | Интервал x2, final review |
+
+## Конфигурация (.env)
 
 ```env
 # Обязательно
-GEMINI_API_KEY=your_key
+GLM_API_KEY=csk-...           # Cerebras API key
 DROID_PROJECT_PATH=/path/to/project
 
 # Опционально
-CEREBRAS_API_KEY=your_key  # fallback при недоступности Gemini
 DROID_BINARY=droid
 AUTO_GIT_PUSH=true
-DISPLAY_MODE=visible  # visible или silent
-BENDER_ESCALATE_AFTER=5  # после скольких неудач спрашивать человека
-WATCHDOG_INTERVAL=300  # секунд между проверками (default: 300 = 5 мин)
-WATCHDOG_TIMEOUT=3600  # общий таймаут на задачу (default: 3600 = 1 час)
+DISPLAY_MODE=visible
 ```
 
-## Структура проекта
+## LLM
+
+- **Primary:** GLM (Cerebras `zai-glm-4.7`) - thinking model с reasoning
+- **Fallback:** Qwen (`qwen-3-235b-a22b-instruct-2507`)
+
+## Структура
 
 ```
-parser_maker/
-├── core/           # Droid Controller, Config
-├── bender/         # Gemini + GLM supervisor (watchdog, analyzer, enforcer)
-├── pipeline/       # 6-step pipeline, git manager
-├── state/          # Persistence, recovery
-├── cli/            # CLI interface, display modes
-├── steps/          # Конфигурация 6 шагов (YAML)
-└── integrations/   # Telegram notifications, desktop fallback
+bender/
+├── bender/
+│   ├── glm_client.py      # GLM API клиент
+│   ├── llm_router.py      # GLM + Qwen fallback
+│   ├── task_clarifier.py  # Анализ задачи
+│   ├── task_manager.py    # Управление выполнением
+│   ├── worker_manager.py  # Управление workers
+│   ├── log_watcher.py     # Анализ логов
+│   └── workers/           # Copilot, Droid, Codex workers
+├── cli/
+│   └── main.py            # CLI интерфейс
+├── core/
+│   └── config.py          # Конфигурация
+└── tests/
 ```
