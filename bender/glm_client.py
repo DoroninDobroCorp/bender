@@ -19,12 +19,12 @@ logger = logging.getLogger(__name__)
 class GLMClient(BaseLLMClient):
     """Клиент для GLM API (Cerebras)
     
-    Используется как fallback при недоступности Gemini.
-    Поддерживает Cerebras модели: qwen-3-32b, llama-4-scout-17b-16e-instruct
+    Основной LLM провайдер.
+    Поддерживает Cerebras модели: glm-4.7
     """
     
     API_URL = "https://api.cerebras.ai/v1/chat/completions"
-    DEFAULT_MODEL = "qwen-3-32b"
+    DEFAULT_MODEL = "zai-glm-4.7"
     DEFAULT_TIMEOUT = 120.0
     MAX_RETRIES = 3
     RETRY_DELAY = 1.0
@@ -113,6 +113,12 @@ class GLMClient(BaseLLMClient):
                 
                 message = choices[0].get("message", {})
                 content = message.get("content", "")
+                reasoning = message.get("reasoning", "")
+                
+                # Логируем reasoning если есть (GLM thinking)
+                if reasoning:
+                    logger.debug(f"GLM reasoning: {reasoning[:200]}...")
+                
                 if not content or not content.strip():
                     raise LLMResponseError("GLM returned empty response")
                 
@@ -149,3 +155,61 @@ class GLMClient(BaseLLMClient):
             raise
         except Exception as e:
             raise JSONParseError(f"Failed to parse JSON from GLM response: {e}", raw_text=response)
+    
+    async def generate_with_reasoning(
+        self,
+        prompt: str,
+        temperature: float = 0.7,
+    ) -> tuple[str, str]:
+        """Генерировать ответ с reasoning (для thinking моделей)
+        
+        Returns:
+            Tuple[content, reasoning]
+        """
+        last_error: Optional[Exception] = None
+        
+        for attempt in range(1, self.MAX_RETRIES + 1):
+            try:
+                client = await self._get_client()
+                response = await client.post(
+                    self.API_URL,
+                    json={
+                        "model": self.model_name,
+                        "messages": [{"role": "user", "content": prompt}],
+                        "temperature": temperature,
+                        "max_tokens": 8192
+                    }
+                )
+                response.raise_for_status()
+                data = response.json()
+                
+                choices = data.get("choices", [])
+                if not choices:
+                    raise LLMResponseError("GLM returned no choices")
+                
+                message = choices[0].get("message", {})
+                content = message.get("content", "")
+                reasoning = message.get("reasoning", "")
+                
+                if not content or not content.strip():
+                    raise LLMResponseError("GLM returned empty response")
+                
+                return content, reasoning
+                
+            except httpx.TimeoutException as e:
+                last_error = e
+                logger.warning(f"GLM timeout (attempt {attempt}/{self.MAX_RETRIES}): {e}")
+            except httpx.HTTPStatusError as e:
+                last_error = e
+                logger.warning(f"GLM HTTP error {e.response.status_code} (attempt {attempt}/{self.MAX_RETRIES})")
+                if e.response.status_code == 429:
+                    await asyncio.sleep(self.RETRY_DELAY * attempt * 2)
+                    continue
+            except Exception as e:
+                last_error = e
+                logger.warning(f"GLM error (attempt {attempt}/{self.MAX_RETRIES}): {e}")
+            
+            if attempt < self.MAX_RETRIES:
+                await asyncio.sleep(self.RETRY_DELAY * (2 ** (attempt - 1)))
+        
+        raise LLMConnectionError(f"GLM failed after {self.MAX_RETRIES} attempts: {last_error}")

@@ -82,8 +82,8 @@ class PipelineOrchestrator:
     def __init__(
         self,
         project_path: str,
-        gemini_api_key: str,
-        glm_api_key: Optional[str] = None,
+        glm_api_key: str,
+        gemini_api_key: Optional[str] = None,
         steps_yaml: Optional[str] = None,
         auto_git_push: bool = True,
         display_mode: str = "visible",
@@ -100,8 +100,8 @@ class PipelineOrchestrator:
         # Компоненты
         self.droid: Optional[DroidController] = None
         self.bender = BenderSupervisor(
-            gemini_api_key=gemini_api_key,
             glm_api_key=glm_api_key,
+            gemini_api_key=gemini_api_key,
             escalate_after=escalate_after,
             display_mode=display_mode
         )

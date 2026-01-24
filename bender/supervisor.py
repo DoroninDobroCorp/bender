@@ -40,8 +40,8 @@ class BenderSupervisor:
     
     def __init__(
         self,
-        gemini_api_key: str,
-        glm_api_key: Optional[str] = None,
+        glm_api_key: str,
+        gemini_api_key: Optional[str] = None,
         escalate_after: int = 5,
         watchdog_interval: int = 300,
         watchdog_timeout: int = 3600,
@@ -49,8 +49,8 @@ class BenderSupervisor:
     ):
         # LLM Router
         self.llm = LLMRouter(
-            gemini_api_key=gemini_api_key,
-            glm_api_key=glm_api_key
+            glm_api_key=glm_api_key,
+            gemini_api_key=gemini_api_key
         )
         
         # Компоненты

@@ -10,7 +10,7 @@ from pydantic import field_validator, model_validator
 
 
 class Config(BaseSettings):
-    """Конфигурация Parser Maker"""
+    """Конфигурация Bender"""
     
     model_config = SettingsConfigDict(
         env_file='.env',
@@ -18,12 +18,11 @@ class Config(BaseSettings):
         extra='ignore'
     )
     
-    # Обязательно
-    gemini_api_key: str
+    # Обязательно - GLM (Cerebras) - единственный LLM
+    glm_api_key: str
     droid_project_path: str
     
-    # Опционально - Bender (fallback при недоступности Gemini)
-    glm_api_key: Optional[str] = None
+    # Алиас для glm_api_key
     cerebras_api_key: Optional[str] = None
     
     # Опционально - Droid
@@ -46,11 +45,10 @@ class Config(BaseSettings):
     idle_timeout: int = 120
     check_interval: float = 2.0
     
-    # Опционально - LLM settings
+    # Опционально - LLM settings (только GLM)
     llm_max_retries: int = 3
     llm_retry_delay: float = 1.0
     llm_requests_per_minute: int = 60
-    llm_health_check_timeout: float = 30.0
     
     # Опционально - Analyzer settings
     analyzer_truncate_length: int = 3000
@@ -106,7 +104,6 @@ class Config(BaseSettings):
     def use_cerebras_as_glm_fallback(self) -> 'Config':
         """Use cerebras_api_key as fallback for glm_api_key"""
         if self.glm_api_key is None and self.cerebras_api_key is not None:
-            # Use object.__setattr__ to bypass frozen validation if needed
             try:
                 self.glm_api_key = self.cerebras_api_key
             except Exception:
