@@ -1,16 +1,16 @@
 [project]
-name = "parser-maker"
-version = "0.1.0"
-description = "Автоматизация создания парсеров через LLM с 6-шаговым pipeline"
+name = "bender"
+version = "2.0.0"
+description = "CLI Supervisor - следит за выполнением задач AI моделями"
 readme = "README.md"
 requires-python = ">=3.10"
 dependencies = [
     "pydantic>=2.0",
     "pydantic-settings>=2.0",
-    "google-genai>=1.0.0",
     "httpx>=0.27.0",
     "pyyaml>=6.0",
     "click>=8.0",
+    "python-dotenv>=1.0.0",
 ]
 
 [project.optional-dependencies]
@@ -24,7 +24,7 @@ dev = [
 ]
 
 [project.scripts]
-parser-maker = "cli.main:main"
+bd = "cli.main:main"
 
 [build-system]
 requires = ["setuptools>=61.0"]
