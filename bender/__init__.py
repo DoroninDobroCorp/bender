@@ -8,7 +8,7 @@ Fallback: Qwen (qwen-3-235b-a22b-instruct-2507)
 """
 
 # Core clients - GLM + Qwen fallback
-from .glm_client import GLMClient
+from .glm_client import GLMClient, LLMUsage
 from .llm_router import LLMRouter
 
 # Workers
@@ -41,6 +41,7 @@ from .enforcer import TaskEnforcer, EnforcementResult
 __all__ = [
     # Core - GLM + Qwen fallback
     "GLMClient",
+    "LLMUsage",
     "LLMRouter",
     # Workers
     "BaseWorker",

@@ -32,6 +32,9 @@ class ContextBudget:
     max_tokens: int = 100_000  # GLM ~128k, оставляем запас
     current_tokens: int = 0
     warning_threshold: float = 0.75  # 75% - начинаем компрессию
+    # Счётчики за всю сессию
+    total_input_tokens: int = 0
+    total_output_tokens: int = 0
     
     @property
     def usage_percent(self) -> float:
@@ -40,6 +43,10 @@ class ContextBudget:
     @property
     def needs_compression(self) -> bool:
         return self.usage_percent >= self.warning_threshold
+    
+    @property
+    def total_tokens(self) -> int:
+        return self.total_input_tokens + self.total_output_tokens
     
     def estimate_tokens(self, text: str) -> int:
         """Примерная оценка токенов (1 токен ≈ 4 символа для английского)"""
@@ -151,12 +158,17 @@ class ContextManager:
         return '\n'.join(lines)
     
     def reset(self) -> None:
-        """Сбросить состояние для новой задачи"""
+        """Сбросить состояние для новой задачи (НЕ сбрасывает total tokens)"""
         self.history = []
         self.budget.current_tokens = 0
         logger.debug(
             f"Context reset. Total compressions in session: {self._compression_count}"
         )
+    
+    def add_llm_usage(self, input_tokens: int, output_tokens: int) -> None:
+        """Добавить использование токенов от LLM вызова"""
+        self.budget.total_input_tokens += input_tokens
+        self.budget.total_output_tokens += output_tokens
     
     def get_stats(self) -> dict:
         """Получить статистику контекста"""
@@ -167,4 +179,8 @@ class ContextManager:
             "tokens_max": self.budget.max_tokens,
             "usage_percent": f"{self.budget.usage_percent:.1%}",
             "compressions": self._compression_count,
+            # Session totals
+            "session_input_tokens": self.budget.total_input_tokens,
+            "session_output_tokens": self.budget.total_output_tokens,
+            "session_total_tokens": self.budget.total_tokens,
         }

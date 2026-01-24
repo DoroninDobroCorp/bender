@@ -4,7 +4,8 @@ GLM API Client (Cerebras) - Fallback для Gemini
 
 import asyncio
 import logging
-from typing import Dict, Any, Optional
+from typing import Dict, Any, Optional, Callable
+from dataclasses import dataclass
 
 import httpx
 
@@ -14,6 +15,17 @@ from core.exceptions import LLMResponseError, LLMConnectionError
 
 
 logger = logging.getLogger(__name__)
+
+
+@dataclass
+class LLMUsage:
+    """Статистика использования токенов"""
+    input_tokens: int = 0
+    output_tokens: int = 0
+    
+    @property
+    def total(self) -> int:
+        return self.input_tokens + self.output_tokens
 
 
 class GLMClient(BaseLLMClient):
@@ -33,6 +45,22 @@ class GLMClient(BaseLLMClient):
         model = model_name or self.DEFAULT_MODEL
         super().__init__(api_key, model)
         self._client: Optional[httpx.AsyncClient] = None
+        # Session token tracking
+        self._session_input_tokens: int = 0
+        self._session_output_tokens: int = 0
+        self._on_usage: Optional[Callable[[int, int], None]] = None
+    
+    def set_usage_callback(self, callback: Callable[[int, int], None]) -> None:
+        """Установить callback для отслеживания токенов"""
+        self._on_usage = callback
+    
+    @property
+    def session_usage(self) -> LLMUsage:
+        """Получить использование токенов за сессию"""
+        return LLMUsage(
+            input_tokens=self._session_input_tokens,
+            output_tokens=self._session_output_tokens
+        )
     
     @property
     def provider(self) -> LLMProvider:
@@ -119,6 +147,17 @@ class GLMClient(BaseLLMClient):
                 if reasoning:
                     logger.debug(f"GLM reasoning: {reasoning[:200]}...")
                 
+                # Track token usage
+                usage = data.get("usage", {})
+                input_tokens = usage.get("prompt_tokens", 0)
+                output_tokens = usage.get("completion_tokens", 0)
+                self._session_input_tokens += input_tokens
+                self._session_output_tokens += output_tokens
+                
+                # Callback if set
+                if self._on_usage:
+                    self._on_usage(input_tokens, output_tokens)
+                
                 if not content or not content.strip():
                     raise LLMResponseError("GLM returned empty response")
                 
@@ -190,6 +229,16 @@ class GLMClient(BaseLLMClient):
                 message = choices[0].get("message", {})
                 content = message.get("content", "")
                 reasoning = message.get("reasoning", "")
+                
+                # Track token usage
+                usage = data.get("usage", {})
+                input_tokens = usage.get("prompt_tokens", 0)
+                output_tokens = usage.get("completion_tokens", 0)
+                self._session_input_tokens += input_tokens
+                self._session_output_tokens += output_tokens
+                
+                if self._on_usage:
+                    self._on_usage(input_tokens, output_tokens)
                 
                 if not content or not content.strip():
                     raise LLMResponseError("GLM returned empty response")

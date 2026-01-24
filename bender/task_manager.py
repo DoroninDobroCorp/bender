@@ -146,6 +146,9 @@ class TaskManager:
         self.log_filter = LogFilter()
         self.clarifier = TaskClarifier(glm_client, on_ask_user=on_need_human)
         
+        # Connect GLM token tracking to context manager
+        self.glm.set_usage_callback(self.log_watcher.context.add_llm_usage)
+        
         self._current_task: Optional[str] = None
         self._clarified_task: Optional[ClarifiedTask] = None
         self._task_state = TaskState.PENDING

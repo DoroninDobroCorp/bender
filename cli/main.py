@@ -224,6 +224,15 @@ async def _run_task(task: str, worker_type: Optional[str], interval: int, simple
             click.echo(f"   Tokens: {ctx_stats['tokens_used']:,} / {ctx_stats['tokens_max']:,} ({ctx_stats['usage_percent']})")
             click.echo(f"   Compressions: {ctx_stats['compressions']}")
         
+        # Always show session token usage (GLM supervisor tokens)
+        ctx_stats = _task_manager.log_watcher.get_context_stats()
+        if ctx_stats['session_total_tokens'] > 0:
+            click.echo()
+            click.echo("🔮 Bender (GLM) Token Usage:")
+            click.echo(f"   Input:  {ctx_stats['session_input_tokens']:,}")
+            click.echo(f"   Output: {ctx_stats['session_output_tokens']:,}")
+            click.echo(f"   Total:  {ctx_stats['session_total_tokens']:,}")
+        
     except asyncio.CancelledError:
         click.echo("\n⚠️  Task cancelled")
     except Exception as e:
