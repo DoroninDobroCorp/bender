@@ -215,6 +215,15 @@ async def _run_task(task: str, worker_type: Optional[str], interval: int, simple
             click.echo(f"   Cached: {result.cached_tokens:,}")
             click.echo(f"   Total:  {result.input_tokens + result.output_tokens:,}")
         
+        # Show context stats in debug mode
+        if _debug:
+            ctx_stats = _task_manager.log_watcher.get_context_stats()
+            click.echo()
+            click.echo("🧠 Context Stats:")
+            click.echo(f"   History: {ctx_stats['history_size']} (full: {ctx_stats['full_history_size']})")
+            click.echo(f"   Tokens: {ctx_stats['tokens_used']:,} / {ctx_stats['tokens_max']:,} ({ctx_stats['usage_percent']})")
+            click.echo(f"   Compressions: {ctx_stats['compressions']}")
+        
     except asyncio.CancelledError:
         click.echo("\n⚠️  Task cancelled")
     except Exception as e:

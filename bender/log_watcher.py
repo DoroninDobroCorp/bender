@@ -1,5 +1,10 @@
 """
 Log Watcher - мониторинг и анализ логов CLI workers
+
+Оптимизации контекста:
+- Tail логов (последние N строк)
+- Скользящее окно истории
+- Компрессия при переполнении
 """
 
 import asyncio
@@ -11,6 +16,7 @@ from enum import Enum
 from .log_filter import LogFilter, FilteredLog
 from .glm_client import GLMClient
 from .workers.base import WorkerStatus
+from .context_manager import ContextManager
 
 logger = logging.getLogger(__name__)
 
@@ -46,7 +52,9 @@ class LogWatcher:
 
 ЗАДАЧА: {task}
 
-ЛОГ РАБОТЫ (только сообщения модели, без вывода команд):
+{history}
+
+ЛОГ РАБОТЫ (последние сообщения, без вывода команд):
 ```
 {log}
 ```
@@ -77,6 +85,7 @@ class LogWatcher:
     def __init__(self, glm_client: GLMClient, log_filter: Optional[LogFilter] = None):
         self.glm = glm_client
         self.filter = log_filter or LogFilter()
+        self.context = ContextManager()  # NEW: управление контекстом
         self._last_log_hash: Optional[str] = None
         self._no_change_count: int = 0
     
@@ -88,8 +97,11 @@ class LogWatcher:
     ) -> WatcherAnalysis:
         """Проанализировать лог и определить статус"""
         
+        # NEW: Обрезаем лог до последних N строк
+        trimmed_log = self.context.tail_log(raw_log)
+        
         # Фильтруем лог
-        filtered = self.filter.filter(raw_log)
+        filtered = self.filter.filter(trimmed_log)
         
         # Быстрые проверки без GLM
         if filtered.has_completion and not filtered.has_error:
@@ -131,7 +143,12 @@ class LogWatcher:
             )
         
         # Полный анализ через GLM
-        return await self._analyze_with_glm(filtered.model_messages, task, elapsed_seconds)
+        analysis = await self._analyze_with_glm(filtered.model_messages, task, elapsed_seconds)
+        
+        # NEW: Сохраняем в историю
+        self.context.add_checkpoint(analysis.result.value, analysis.summary)
+        
+        return analysis
     
     async def _analyze_with_glm(
         self,
@@ -141,14 +158,18 @@ class LogWatcher:
     ) -> WatcherAnalysis:
         """Глубокий анализ через GLM"""
         
-        # Ограничить длину лога для GLM
-        if len(log) > 4000:
-            log = log[-4000:]  # Последние 4000 символов
+        # NEW: Лог уже обрезан в analyze(), но добавим защиту
+        if len(log) > self.context.MAX_LOG_CHARS:
+            log = log[-self.context.MAX_LOG_CHARS:]
+        
+        # NEW: Добавляем историю проверок для контекста
+        history_context = self.context.get_history_context()
         
         prompt = self.ANALYSIS_PROMPT.format(
             task=task,
             log=log,
             elapsed=elapsed,
+            history=history_context,
         )
         
         try:
@@ -201,3 +222,8 @@ class LogWatcher:
         """Сбросить состояние watcher'а"""
         self._last_log_hash = None
         self._no_change_count = 0
+        self.context.reset()  # NEW: сброс контекста
+    
+    def get_context_stats(self) -> dict:
+        """Получить статистику контекста"""
+        return self.context.get_stats()

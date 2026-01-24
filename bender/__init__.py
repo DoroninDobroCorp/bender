@@ -26,6 +26,7 @@ from .worker_manager import WorkerManager, WorkerType, ManagerConfig
 # Log processing
 from .log_filter import LogFilter, FilteredLog
 from .log_watcher import LogWatcher, AnalysisResult, WatcherAnalysis
+from .context_manager import ContextManager, ContextBudget
 
 # Task management
 from .task_clarifier import TaskClarifier, TaskComplexity, ClarifiedTask
@@ -58,6 +59,8 @@ __all__ = [
     "LogWatcher",
     "AnalysisResult",
     "WatcherAnalysis",
+    "ContextManager",
+    "ContextBudget",
     # Task management
     "TaskClarifier",
     "TaskComplexity",
