@@ -26,9 +26,9 @@ bender/workers/base.py
 bender/workers/codex.py
 bender/workers/copilot.py
 bender/workers/droid.py
-cli/__init__.py
-cli/display.py
-cli/main.py
+bender_cli/__init__.py
+bender_cli/display.py
+bender_cli/main.py
 core/__init__.py
 core/audit.py
 core/config.py

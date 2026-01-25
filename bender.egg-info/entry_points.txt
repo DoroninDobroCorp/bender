@@ -1,3 +1,3 @@
 [console_scripts]
-bd = cli.main:main
-bender = cli.main:main
+bd = bender_cli.main:main
+bender = bender_cli.main:main

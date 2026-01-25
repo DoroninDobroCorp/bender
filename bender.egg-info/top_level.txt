@@ -1,5 +1,5 @@
 bender
-cli
+bender_cli
 core
 pipeline
 state
