@@ -73,6 +73,7 @@ class WorkerManager:
     
     def _create_worker(self, worker_type: WorkerType) -> BaseWorker:
         """Создать worker нужного типа"""
+        logger.info(f"Creating worker with project_path: {self.config.project_path}")
         worker_config = WorkerConfig(
             project_path=self.config.project_path,
             check_interval=self.config.check_interval,

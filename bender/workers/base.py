@@ -94,10 +94,13 @@ class BaseWorker(ABC):
         # Правильно экранируем команду для shell
         cmd_str = shlex.join(cli_cmd)
         
+        # Команда с cd в нужную директорию
+        full_cmd = f"cd {shlex.quote(str(self.config.project_path))} && {cmd_str}"
+        
         # Всегда запускаем detached, потом можем attach если нужно
         return [
             "tmux", "new-session", "-d", "-s", self.session_id,
-            cmd_str
+            "bash", "-c", full_cmd
         ]
     
     async def start(self, task: str, context: Optional[str] = None) -> None:
@@ -124,6 +127,11 @@ class BaseWorker(ABC):
             )
             await process.wait()
             logger.info(f"[{self.WORKER_NAME}] Session {self.session_id} started")
+            
+            # Ждём загрузки CLI и отправляем задачу
+            await asyncio.sleep(self.STARTUP_DELAY)
+            await self.send_input(formatted_task)
+            logger.info(f"[{self.WORKER_NAME}] Task sent to CLI")
             
         except Exception as e:
             logger.error(f"[{self.WORKER_NAME}] Failed to start: {e}")

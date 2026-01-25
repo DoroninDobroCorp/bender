@@ -119,6 +119,8 @@ class CopilotWorker(BaseWorker):
     async def _start_background(self, cmd: List[str]) -> None:
         """Запустить в фоне через subprocess"""
         try:
+            logger.info(f"[{self.WORKER_NAME}] Running: {' '.join(cmd)}")
+            logger.info(f"[{self.WORKER_NAME}] CWD: {self.config.project_path}")
             self._process = await asyncio.create_subprocess_exec(
                 *cmd,
                 cwd=str(self.config.project_path),
@@ -139,9 +141,9 @@ class CopilotWorker(BaseWorker):
         # Создаём лог файл для захвата вывода
         self._log_file = f"/tmp/{self._tmux_session}.log"
         
-        # Команда с логированием в файл
+        # Команда с логированием в файл (без паузы - закроется автоматически)
         cmd_str = " ".join(shlex.quote(c) for c in cmd)
-        full_cmd = f"cd {shlex.quote(str(self.config.project_path))} && {cmd_str} 2>&1 | tee {self._log_file}"
+        full_cmd = f"cd {shlex.quote(str(self.config.project_path))} && echo '🤖 Bender visible mode - copilot running...' && echo '' && {cmd_str} 2>&1 | tee {self._log_file}"
         
         try:
             # Создаём tmux сессию
@@ -156,12 +158,35 @@ class CopilotWorker(BaseWorker):
             logger.info(f"[{self.WORKER_NAME}] Tmux session started: {self._tmux_session}")
             logger.info(f"[{self.WORKER_NAME}] Attach with: tmux attach -t {self._tmux_session}")
             
-            # Автоматически аттачимся в новом окне терминала
-            attach_proc = await asyncio.create_subprocess_exec(
-                "tmux", "attach", "-t", self._tmux_session,
-                stdin=asyncio.subprocess.DEVNULL,
-            )
-            # Не ждём - пусть работает параллельно
+            # Сохраняем window ID для закрытия потом
+            self._terminal_window_id = None
+            
+            # Открываем в новом окне терминала (macOS) в правильной директории
+            try:
+                project_path = str(self.config.project_path)
+                # Создаём новое окно и получаем его ID
+                applescript = f'''
+                tell application "Terminal"
+                    activate
+                    set newTab to do script "cd {project_path} && tmux attach -t {self._tmux_session}; exit"
+                    set newWindow to window 1
+                    return id of newWindow
+                end tell
+                '''
+                attach_proc = await asyncio.create_subprocess_exec(
+                    "osascript", "-e", applescript,
+                    stdout=asyncio.subprocess.PIPE,
+                    stderr=asyncio.subprocess.PIPE,
+                )
+                stdout, _ = await attach_proc.communicate()
+                if stdout:
+                    self._terminal_window_id = stdout.decode().strip()
+                    logger.info(f"[{self.WORKER_NAME}] Terminal window ID: {self._terminal_window_id}")
+                logger.info(f"[{self.WORKER_NAME}] Opened Terminal window in {project_path}")
+            except Exception as e:
+                # Fallback: просто логируем команду для ручного подключения
+                logger.warning(f"[{self.WORKER_NAME}] Could not open Terminal: {e}")
+                logger.info(f"[{self.WORKER_NAME}] Open terminal manually: tmux attach -t {self._tmux_session}")
             
         except Exception as e:
             logger.error(f"[{self.WORKER_NAME}] Failed to start tmux: {e}")
@@ -254,12 +279,44 @@ class CopilotWorker(BaseWorker):
             return False, str(e)
     
     async def _wait_visible(self, timeout: float) -> Tuple[bool, str]:
-        """Дождаться завершения в visible mode (tmux)"""
+        """Дождаться завершения в visible mode (tmux)
+        
+        Проверяем лог файл на наличие маркера завершения copilot.
+        """
         import os
         start = asyncio.get_event_loop().time()
         
+        # Маркеры завершения copilot
+        completion_markers = [
+            "Total usage est:",
+            "Total session time:",
+            "Breakdown by AI model:",
+        ]
+        
         while asyncio.get_event_loop().time() - start < timeout:
-            # Проверяем жива ли сессия
+            # Читаем текущий лог
+            if hasattr(self, '_log_file') and os.path.exists(self._log_file):
+                try:
+                    with open(self._log_file, 'r') as f:
+                        log_content = f.read()
+                    
+                    # Проверяем есть ли маркеры завершения
+                    if any(marker in log_content for marker in completion_markers):
+                        self._completed = True
+                        self.status = WorkerStatus.COMPLETED
+                        self._output = log_content
+                        
+                        # Парсим токены
+                        self.token_usage = self._parse_token_usage(self._output)
+                        if self.token_usage:
+                            logger.info(f"[{self.WORKER_NAME}] {self.token_usage}")
+                        
+                        logger.info(f"[{self.WORKER_NAME}] Visible session completed")
+                        return True, self._output
+                except Exception as e:
+                    logger.warning(f"[{self.WORKER_NAME}] Error reading log: {e}")
+            
+            # Проверяем жива ли сессия (fallback)
             proc = await asyncio.create_subprocess_exec(
                 "tmux", "has-session", "-t", self._tmux_session,
                 stdout=asyncio.subprocess.DEVNULL,
@@ -268,21 +325,15 @@ class CopilotWorker(BaseWorker):
             ret = await proc.wait()
             
             if ret != 0:
-                # Сессия завершилась - читаем лог
+                # Сессия завершилась - читаем последний лог
                 self._completed = True
                 self.status = WorkerStatus.COMPLETED
                 
                 if hasattr(self, '_log_file') and os.path.exists(self._log_file):
                     with open(self._log_file, 'r') as f:
                         self._output = f.read()
-                    os.remove(self._log_file)
                 
-                # Парсим токены
-                self.token_usage = self._parse_token_usage(self._output)
-                if self.token_usage:
-                    logger.info(f"[{self.WORKER_NAME}] {self.token_usage}")
-                
-                logger.info(f"[{self.WORKER_NAME}] Visible session completed")
+                logger.info(f"[{self.WORKER_NAME}] Visible session closed")
                 return True, self._output
             
             await asyncio.sleep(2)  # Проверяем каждые 2 секунды
@@ -293,16 +344,52 @@ class CopilotWorker(BaseWorker):
     
     async def stop(self) -> None:
         """Остановить copilot"""
-        # Visible mode - убиваем tmux
+        # Visible mode - убиваем tmux и закрываем терминал
         if self.visible and self._tmux_session:
-            logger.info(f"[{self.WORKER_NAME}] Killing tmux session: {self._tmux_session}")
+            session_name = self._tmux_session
+            window_id = getattr(self, '_terminal_window_id', None)
+            
+            logger.info(f"[{self.WORKER_NAME}] Killing tmux session: {session_name}")
             proc = await asyncio.create_subprocess_exec(
-                "tmux", "kill-session", "-t", self._tmux_session,
+                "tmux", "kill-session", "-t", session_name,
                 stdout=asyncio.subprocess.DEVNULL,
                 stderr=asyncio.subprocess.DEVNULL,
             )
             await proc.wait()
+            
+            # Закрываем окно терминала через AppleScript по ID
+            if window_id:
+                try:
+                    applescript = f'''
+                    tell application "Terminal"
+                        repeat with w in windows
+                            if id of w is {window_id} then
+                                close w
+                                exit repeat
+                            end if
+                        end repeat
+                    end tell
+                    '''
+                    close_proc = await asyncio.create_subprocess_exec(
+                        "osascript", "-e", applescript,
+                        stdout=asyncio.subprocess.DEVNULL,
+                        stderr=asyncio.subprocess.DEVNULL,
+                    )
+                    await close_proc.wait()
+                    logger.info(f"[{self.WORKER_NAME}] Closed Terminal window (ID: {window_id})")
+                except Exception as e:
+                    logger.warning(f"[{self.WORKER_NAME}] Could not close Terminal: {e}")
+            
             self._tmux_session = None
+            self._terminal_window_id = None
+            
+            # Удаляем лог файл
+            import os
+            if hasattr(self, '_log_file') and self._log_file and os.path.exists(self._log_file):
+                try:
+                    os.remove(self._log_file)
+                except Exception:
+                    pass
         
         # Background mode - убиваем процесс
         if self._process and self._process.returncode is None:

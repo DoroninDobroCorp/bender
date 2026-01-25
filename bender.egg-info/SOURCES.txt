@@ -3,6 +3,7 @@ pyproject.toml
 bender/__init__.py
 bender/analyzer.py
 bender/base_client.py
+bender/context_manager.py
 bender/enforcer.py
 bender/glm_client.py
 bender/llm_router.py

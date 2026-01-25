@@ -24,6 +24,7 @@ dev = [
 ]
 
 [project.scripts]
+bender = "cli.main:main"
 bd = "cli.main:main"
 
 [build-system]

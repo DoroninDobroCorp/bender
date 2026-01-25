@@ -39,6 +39,9 @@ class TaskClarifier:
     
     CLARIFY_PROMPT = """Ты помощник по уточнению технических заданий.
 
+Рабочая директория: {project_path}
+(Все относительные пути и упоминания "эта папка", "текущая директория" относятся к ней)
+
 Задача от пользователя:
 {task}
 
@@ -83,9 +86,11 @@ class TaskClarifier:
         self,
         llm: LLMRouter,
         on_ask_user: Optional[Callable[[str], Awaitable[str]]] = None,
+        project_path: Optional[str] = None,
     ):
         self.llm = llm
         self.on_ask_user = on_ask_user
+        self.project_path = project_path or "."
     
     async def clarify(self, task: str) -> ClarifiedTask:
         """Уточнить задачу
@@ -99,7 +104,7 @@ class TaskClarifier:
         logger.info(f"[Clarifier] Analyzing task: {task[:50]}...")
         
         # Первичный анализ
-        prompt = self.CLARIFY_PROMPT.format(task=task)
+        prompt = self.CLARIFY_PROMPT.format(task=task, project_path=self.project_path)
         
         try:
             result = await self.llm.generate_json(prompt, temperature=0.3)

@@ -29,9 +29,7 @@ class CodexWorker(BaseWorker):
         """CLI команда для codex"""
         return [
             "codex",
-            "--approval-mode", "full-auto",
-            "--dangerously-auto-approve-everything",
-            "--model", "o3",
+            "--full-auto",
         ]
     
     def format_task(self, task: str, context: Optional[str] = None) -> str:

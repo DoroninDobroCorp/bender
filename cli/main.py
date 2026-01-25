@@ -37,9 +37,13 @@ _shutdown_event: Optional[asyncio.Event] = None
 
 def handle_shutdown(signum, frame):
     """Handle Ctrl+C"""
+    if _task_manager:
+        _task_manager.request_stop()
     if _shutdown_event:
         _shutdown_event.set()
     click.echo("\n⚠️  Stopping...")
+    # Force exit on second Ctrl+C
+    signal.signal(signal.SIGINT, lambda s, f: sys.exit(1))
 
 
 @click.group()
@@ -66,6 +70,7 @@ def cli(ctx, debug):
 @cli.command()
 @click.argument('task')
 @click.option('--droid', is_flag=True, help='Force droid worker (simple tasks)')
+@click.option('--opus', is_flag=True, help='Force opus/copilot worker (medium tasks)')
 @click.option('--codex', is_flag=True, help='Force codex worker (complex tasks)')
 @click.option('--auto', '-a', is_flag=True, default=True, help='Auto-select worker by complexity (default)')
 @click.option('--interval', '-i', type=int, default=30, help='Log check interval in seconds')
@@ -73,7 +78,7 @@ def cli(ctx, debug):
 @click.option('--visible', '-v', is_flag=True, help='Show terminal windows')
 @click.option('--project', '-p', type=click.Path(exists=True), help='Project path')
 @click.pass_context
-def run(ctx, task, droid, codex, auto, interval, simple, visible, project):
+def run(ctx, task, droid, opus, codex, auto, interval, simple, visible, project):
     """Run a task with Bender supervision
     
     By default, Bender will:
@@ -93,6 +98,8 @@ def run(ctx, task, droid, codex, auto, interval, simple, visible, project):
     # Determine worker type (None = auto-select)
     if codex:
         worker_type = 'codex'
+    elif opus:
+        worker_type = 'opus'
     elif droid:
         worker_type = 'droid'
     else:
@@ -127,11 +134,11 @@ async def _run_task(task: str, worker_type: Optional[str], interval: int, simple
         click.echo("   Make sure .env file exists with GLM_API_KEY", err=True)
         sys.exit(1)
     
-    # Determine project path
+    # Determine project path - use current working directory by default
     if project_path:
         proj_path = Path(project_path)
     else:
-        proj_path = Path(config.droid_project_path)
+        proj_path = Path.cwd()
     
     # Import here to avoid circular imports
     from bender.glm_client import GLMClient
@@ -197,7 +204,24 @@ async def _run_task(task: str, worker_type: Optional[str], interval: int, simple
             click.echo(f"   Complexity: {result.complexity.value}")
         click.echo(f"   Attempts: {result.attempts}, Nudges: {result.nudges}")
         click.echo(f"   Time: {result.total_time:.1f}s")
-        click.echo(f"   Summary: {result.final_summary[:100]}{'...' if len(result.final_summary) > 100 else ''}")
+        
+        # Show full output from worker (the actual result)
+        if result.full_output:
+            click.echo()
+            click.echo("📄 Result:")
+            click.echo("─" * 60)
+            # Clean up output - remove ANSI codes and excessive whitespace
+            output = result.full_output.strip()
+            # Remove common noise patterns
+            for noise in ['🤖 Bender visible mode - copilot running...', 'Total usage est:', 'API time spent:', 'Total session time:', 'Total code changes:', 'Breakdown by AI model:']:
+                if noise in output:
+                    # Keep only the main content before statistics
+                    parts = output.split('Total usage est:')
+                    if len(parts) > 1:
+                        output = parts[0].strip()
+                    break
+            click.echo(output)
+            click.echo("─" * 60)
         
         # Show acceptance criteria if any
         if result.acceptance_criteria and len(result.acceptance_criteria) > 1:
@@ -216,7 +240,7 @@ async def _run_task(task: str, worker_type: Optional[str], interval: int, simple
             click.echo(f"   Total:  {result.input_tokens + result.output_tokens:,}")
         
         # Show context stats in debug mode
-        if _debug:
+        if debug:
             ctx_stats = _task_manager.log_watcher.get_context_stats()
             click.echo()
             click.echo("🧠 Context Stats:")

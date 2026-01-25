@@ -47,6 +47,7 @@ class TaskResult:
     total_time: float = 0.0
     verification_passed: bool = False
     final_summary: str = ""
+    full_output: str = ""  # Полный вывод worker'а
     error: Optional[str] = None
     # Token usage (только для copilot worker)
     input_tokens: int = 0
@@ -144,7 +145,11 @@ class TaskManager:
         )
         self.log_watcher = LogWatcher(glm_client)
         self.log_filter = LogFilter()
-        self.clarifier = TaskClarifier(glm_client, on_ask_user=on_need_human)
+        self.clarifier = TaskClarifier(
+            glm_client, 
+            on_ask_user=on_need_human,
+            project_path=str(manager_config.project_path),
+        )
         
         # Connect GLM token tracking to context manager
         self.glm.set_usage_callback(self.log_watcher.context.add_llm_usage)
@@ -155,6 +160,11 @@ class TaskManager:
         self._history: List[TaskHistory] = []
         self._accumulated_log: str = ""
         self._nudge_count: int = 0
+        self._stop_requested: bool = False
+    
+    def request_stop(self) -> None:
+        """Request graceful stop of current task"""
+        self._stop_requested = True
     
     async def _on_worker_output(self, output: str) -> None:
         """Callback при новом выводе от worker'а"""
@@ -328,6 +338,7 @@ class TaskManager:
             total_time=total_time,
             verification_passed=verification_passed,
             final_summary=final_summary,
+            full_output=self._accumulated_log,
             input_tokens=input_tokens,
             output_tokens=output_tokens,
             cached_tokens=cached_tokens,
@@ -384,8 +395,17 @@ class TaskManager:
         
         Если worker говорит "не закончено" - пинаем его вместо restart.
         """
-        while True:
+        while not self._stop_requested:
             await asyncio.sleep(self.worker_manager.current_worker.effective_interval)
+            
+            # Check for stop request
+            if self._stop_requested:
+                return WatcherAnalysis(
+                    result=AnalysisResult.ERROR,
+                    summary="Stopped by user",
+                    suggestion="",
+                    should_restart=False,
+                )
             
             # Проверить жив ли worker
             if not self.worker_manager.is_running:

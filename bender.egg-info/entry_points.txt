@@ -1,2 +1,3 @@
 [console_scripts]
 bd = cli.main:main
+bender = cli.main:main
