@@ -347,7 +347,6 @@ class CopilotWorker(BaseWorker):
         # Visible mode - убиваем tmux и закрываем терминал
         if self.visible and self._tmux_session:
             session_name = self._tmux_session
-            window_id = getattr(self, '_terminal_window_id', None)
             
             logger.info(f"[{self.WORKER_NAME}] Killing tmux session: {session_name}")
             proc = await asyncio.create_subprocess_exec(
@@ -357,28 +356,30 @@ class CopilotWorker(BaseWorker):
             )
             await proc.wait()
             
-            # Закрываем окно терминала через AppleScript по ID
-            if window_id:
-                try:
-                    applescript = f'''
-                    tell application "Terminal"
-                        repeat with w in windows
-                            if id of w is {window_id} then
+            # Закрываем окно терминала по имени сессии в заголовке
+            try:
+                applescript = f'''
+                tell application "Terminal"
+                    set windowList to windows
+                    repeat with w in windowList
+                        try
+                            if name of w contains "{session_name}" then
                                 close w
                                 exit repeat
                             end if
-                        end repeat
-                    end tell
-                    '''
-                    close_proc = await asyncio.create_subprocess_exec(
-                        "osascript", "-e", applescript,
-                        stdout=asyncio.subprocess.DEVNULL,
-                        stderr=asyncio.subprocess.DEVNULL,
-                    )
-                    await close_proc.wait()
-                    logger.info(f"[{self.WORKER_NAME}] Closed Terminal window (ID: {window_id})")
-                except Exception as e:
-                    logger.warning(f"[{self.WORKER_NAME}] Could not close Terminal: {e}")
+                        end try
+                    end repeat
+                end tell
+                '''
+                close_proc = await asyncio.create_subprocess_exec(
+                    "osascript", "-e", applescript,
+                    stdout=asyncio.subprocess.DEVNULL,
+                    stderr=asyncio.subprocess.DEVNULL,
+                )
+                await close_proc.wait()
+                logger.info(f"[{self.WORKER_NAME}] Closed Terminal window for session {session_name}")
+            except Exception as e:
+                logger.warning(f"[{self.WORKER_NAME}] Could not close Terminal: {e}")
             
             self._tmux_session = None
             self._terminal_window_id = None

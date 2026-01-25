@@ -29,7 +29,7 @@ class CodexWorker(BaseWorker):
         """CLI команда для codex"""
         return [
             "codex",
-            "--full-auto",
+            "--dangerously-bypass-approvals-and-sandbox",
         ]
     
     def format_task(self, task: str, context: Optional[str] = None) -> str:
