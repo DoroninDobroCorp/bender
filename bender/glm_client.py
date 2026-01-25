@@ -114,7 +114,8 @@ class GLMClient(BaseLLMClient):
         self,
         prompt: str,
         temperature: float = 0.7,
-        json_mode: bool = False
+        json_mode: bool = False,
+        max_tokens: int = 2048
     ) -> str:
         """Генерировать ответ с retry логикой
         
@@ -122,6 +123,7 @@ class GLMClient(BaseLLMClient):
             prompt: Текст запроса
             temperature: Креативность (0.0-1.0)
             json_mode: Если True, добавляет инструкцию вернуть JSON
+            max_tokens: Максимум токенов в ответе (default 2048, use 512 for JSON)
         
         Returns:
             Текст ответа
@@ -130,8 +132,10 @@ class GLMClient(BaseLLMClient):
             LLMConnectionError: При ошибке соединения после всех retry
             LLMResponseError: При пустом ответе
         """
+        # JSON responses are usually short - limit tokens to save rate limit
         if json_mode:
             prompt = f"{prompt}\n\nRespond with valid JSON only."
+            max_tokens = min(max_tokens, 1024)  # JSON rarely needs more
         
         last_error: Optional[Exception] = None
         prompt_preview = prompt[:100].replace('\n', ' ') + '...' if len(prompt) > 100 else prompt.replace('\n', ' ')
@@ -150,7 +154,7 @@ class GLMClient(BaseLLMClient):
                         "model": self.model_name,
                         "messages": [{"role": "user", "content": prompt}],
                         "temperature": temperature,
-                        "max_tokens": 8192
+                        "max_tokens": max_tokens
                     }
                 )
                 response.raise_for_status()
@@ -224,6 +228,7 @@ class GLMClient(BaseLLMClient):
         self,
         prompt: str,
         temperature: float = 0.7,
+        max_tokens: int = 2048
     ) -> tuple[str, str]:
         """Генерировать ответ с reasoning (для thinking моделей)
         
@@ -241,7 +246,7 @@ class GLMClient(BaseLLMClient):
                         "model": self.model_name,
                         "messages": [{"role": "user", "content": prompt}],
                         "temperature": temperature,
-                        "max_tokens": 8192
+                        "max_tokens": max_tokens
                     }
                 )
                 response.raise_for_status()
