@@ -199,7 +199,7 @@ class GLMClient(BaseLLMClient):
                 last_error = e
                 logger.warning(f"GLM HTTP error {e.response.status_code} (attempt {attempt}/{self.MAX_RETRIES})")
                 if e.response.status_code == 429:
-                    wait_time = 10 * attempt; logger.warning(f"GLM rate limit, waiting {wait_time}s..."); await asyncio.sleep(wait_time)
+                    await asyncio.sleep(self.RETRY_DELAY * attempt * 2)
                     continue
             except Exception as e:
                 last_error = e
@@ -282,7 +282,7 @@ class GLMClient(BaseLLMClient):
                 last_error = e
                 logger.warning(f"GLM HTTP error {e.response.status_code} (attempt {attempt}/{self.MAX_RETRIES})")
                 if e.response.status_code == 429:
-                    wait_time = 10 * attempt; logger.warning(f"GLM rate limit, waiting {wait_time}s..."); await asyncio.sleep(wait_time)
+                    await asyncio.sleep(self.RETRY_DELAY * attempt * 2)
                     continue
             except Exception as e:
                 last_error = e
