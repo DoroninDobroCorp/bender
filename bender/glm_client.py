@@ -134,12 +134,14 @@ class GLMClient(BaseLLMClient):
             prompt = f"{prompt}\n\nRespond with valid JSON only."
         
         last_error: Optional[Exception] = None
+        prompt_preview = prompt[:100].replace('\n', ' ') + '...' if len(prompt) > 100 else prompt.replace('\n', ' ')
         
         for attempt in range(1, self.MAX_RETRIES + 1):
             try:
                 GLMClient._request_count += 1
                 import time
-                GLMClient._last_request_time = time.time()
+                request_start = time.time()
+                GLMClient._last_request_time = request_start
                 
                 client = await self._get_client()
                 response = await client.post(
@@ -154,8 +156,14 @@ class GLMClient(BaseLLMClient):
                 response.raise_for_status()
                 data = response.json()
                 
-                # Log successful request with stats
-                logger.debug(f"GLM request #{GLMClient._request_count} OK (rate_limit_hits: {GLMClient._rate_limit_hits})")
+                # Track token usage
+                usage = data.get("usage", {})
+                input_tokens = usage.get("prompt_tokens", 0)
+                output_tokens = usage.get("completion_tokens", 0)
+                elapsed = time.time() - request_start
+                
+                # Log successful request with full stats
+                logger.info(f"GLM #{GLMClient._request_count}: {input_tokens}+{output_tokens} tokens, {elapsed:.1f}s | {prompt_preview}")
                 
                 choices = data.get("choices", [])
                 if not choices:
@@ -168,11 +176,6 @@ class GLMClient(BaseLLMClient):
                 # Логируем reasoning если есть (GLM thinking)
                 if reasoning:
                     logger.debug(f"GLM reasoning: {reasoning[:200]}...")
-                
-                # Track token usage
-                usage = data.get("usage", {})
-                input_tokens = usage.get("prompt_tokens", 0)
-                output_tokens = usage.get("completion_tokens", 0)
                 self._session_input_tokens += input_tokens
                 self._session_output_tokens += output_tokens
                 
