@@ -122,22 +122,16 @@ class LLMRouter:
         json_mode: bool
     ) -> Optional[str]:
         """Try to generate with a specific client"""
-        for attempt in range(1, self.max_retries + 1):
-            try:
-                await self.rate_limiter.acquire()
-                response = await client.generate(prompt, temperature, json_mode)
-                self.stats[f"{name}_calls"] += 1
-                self._last_provider = name
-                return response
-            except Exception as e:
-                self.stats[f"{name}_errors"] += 1
-                logger.warning(f"{name.upper()} error (attempt {attempt}/{self.max_retries}): {e}")
-                
-                if attempt < self.max_retries:
-                    delay = self.retry_delay * (2 ** (attempt - 1))
-                    await asyncio.sleep(delay)
-        
-        return None
+        try:
+            await self.rate_limiter.acquire()
+            response = await client.generate(prompt, temperature, json_mode)
+            self.stats[f"{name}_calls"] += 1
+            self._last_provider = name
+            return response
+        except Exception as e:
+            self.stats[f"{name}_errors"] += 1
+            logger.warning(f"{name.upper()} error: {e}")
+            return None
     
     async def generate(
         self,
