@@ -76,9 +76,11 @@ def cli(ctx, debug):
 @click.option('--interval', '-i', type=int, default=30, help='Log check interval in seconds')
 @click.option('--simple', '-s', is_flag=True, help='Skip clarification and verification')
 @click.option('--visible', '-v', is_flag=True, help='Show terminal windows')
+@click.option('--review-loop', '-l', is_flag=True, help='Iterative copilot→codex loop until clean')
+@click.option('--max-iterations', type=int, default=10, help='Max iterations for review loop')
 @click.option('--project', '-p', type=click.Path(exists=True), help='Project path')
 @click.pass_context
-def run(ctx, task, droid, opus, codex, auto, interval, simple, visible, project):
+def run(ctx, task, droid, opus, codex, auto, interval, simple, visible, review_loop, max_iterations, project):
     """Run a task with Bender supervision
     
     By default, Bender will:
@@ -89,6 +91,7 @@ def run(ctx, task, droid, opus, codex, auto, interval, simple, visible, project)
     
     Use --simple to skip analysis and verification.
     Use --droid or --codex to force a specific worker.
+    Use --review-loop for iterative copilot→codex→copilot cycle.
     """
     
     # Visible mode = always debug logging
@@ -115,16 +118,89 @@ def run(ctx, task, droid, opus, codex, auto, interval, simple, visible, project)
         worker_type = None  # Auto-select
     
     click.echo(f"🤖 Bender starting...")
-    if worker_type:
+    if review_loop:
+        click.echo(f"   Mode: REVIEW LOOP (copilot→codex→copilot, max {max_iterations} iterations)")
+    elif worker_type:
         click.echo(f"   Worker: {worker_type} (forced)")
     else:
         click.echo(f"   Worker: auto-select by complexity")
     click.echo(f"   Interval: {interval}s")
-    click.echo(f"   Mode: {'simple (no verification)' if simple else 'full (with clarification & verification)'}")
+    if not review_loop:
+        click.echo(f"   Mode: {'simple (no verification)' if simple else 'full (with clarification & verification)'}")
     click.echo(f"   Task: {task[:60]}{'...' if len(task) > 60 else ''}")
     click.echo()
     
-    asyncio.run(_run_task(task, worker_type, interval, simple, visible, project, ctx.obj.get('debug', False)))
+    if review_loop:
+        asyncio.run(_run_review_loop(task, max_iterations, visible, project, ctx.obj.get('debug', False)))
+    else:
+        asyncio.run(_run_task(task, worker_type, interval, simple, visible, project, ctx.obj.get('debug', False)))
+
+
+async def _run_review_loop(task: str, max_iterations: int, visible: bool, project_path: Optional[str], debug: bool = False):
+    """Run iterative review loop: copilot → codex → copilot"""
+    global _shutdown_event
+    
+    _shutdown_event = asyncio.Event()
+    signal.signal(signal.SIGINT, handle_shutdown)
+    signal.signal(signal.SIGTERM, handle_shutdown)
+    
+    try:
+        config = load_config()
+    except Exception as e:
+        click.echo(f"❌ Config error: {e}", err=True)
+        sys.exit(1)
+    
+    from pathlib import Path
+    proj_path = Path(project_path) if project_path else Path.cwd()
+    
+    from bender.llm_router import LLMRouter
+    from bender.review_loop import ReviewLoopManager
+    from bender.worker_manager import ManagerConfig
+    
+    llm = LLMRouter(config.glm_api_key, requests_per_minute=30)
+    
+    manager_config = ManagerConfig(
+        project_path=proj_path,
+        check_interval=60.0,
+        visible=visible,
+    )
+    
+    async def on_status(message: str):
+        click.echo(f"📋 {message}")
+    
+    loop_manager = ReviewLoopManager(
+        llm=llm,
+        manager_config=manager_config,
+        on_status=on_status,
+    )
+    
+    try:
+        result = await loop_manager.run_loop(task, max_iterations=max_iterations)
+        
+        click.echo()
+        if result.success:
+            click.echo(f"✅ Review loop completed successfully!")
+        else:
+            click.echo(f"⚠️  Review loop finished (max iterations reached)")
+        
+        click.echo(f"   Iterations: {result.iterations}")
+        click.echo(f"   Total findings: {result.total_findings}")
+        click.echo(f"   Fixed: {result.fixed_findings}")
+        
+        if result.remaining_findings:
+            click.echo(f"\n📝 Remaining findings:")
+            for f in result.remaining_findings[:10]:
+                click.echo(f"   - {f.severity}: {f.description}")
+        
+    except asyncio.CancelledError:
+        click.echo("\n⚠️  Review loop cancelled")
+    except Exception as e:
+        click.echo(f"\n❌ Error: {e}", err=True)
+        if debug:
+            import traceback
+            traceback.print_exc()
+    finally:
+        await llm.close()
 
 
 async def _run_task(task: str, worker_type: Optional[str], interval: int, simple: bool, visible: bool, project_path: Optional[str], debug: bool = False):
