@@ -8,12 +8,16 @@ from typing import Optional, Literal, List
 from pydantic_settings import BaseSettings, SettingsConfigDict
 from pydantic import field_validator, model_validator
 
+# Путь к .env в папке bender (рядом с этим файлом)
+BENDER_ROOT = Path(__file__).parent.parent
+BENDER_ENV_FILE = BENDER_ROOT / '.env'
+
 
 class Config(BaseSettings):
     """Конфигурация Bender"""
     
     model_config = SettingsConfigDict(
-        env_file='.env',
+        env_file=str(BENDER_ENV_FILE) if BENDER_ENV_FILE.exists() else None,
         env_file_encoding='utf-8',
         extra='ignore'
     )
