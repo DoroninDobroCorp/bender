@@ -41,6 +41,11 @@ class GLMClient(BaseLLMClient):
     MAX_RETRIES = 3
     RETRY_DELAY = 1.0
     
+    # Rate limit tracking
+    _request_count: int = 0
+    _rate_limit_hits: int = 0
+    _last_request_time: float = 0
+    
     def __init__(self, api_key: str, model_name: Optional[str] = None):
         model = model_name or self.DEFAULT_MODEL
         super().__init__(api_key, model)
@@ -61,6 +66,16 @@ class GLMClient(BaseLLMClient):
             input_tokens=self._session_input_tokens,
             output_tokens=self._session_output_tokens
         )
+    
+    @property
+    def api_stats(self) -> dict:
+        """Статистика API вызовов"""
+        return {
+            "requests": GLMClient._request_count,
+            "rate_limit_hits": GLMClient._rate_limit_hits,
+            "tokens_in": self._session_input_tokens,
+            "tokens_out": self._session_output_tokens,
+        }
     
     @property
     def provider(self) -> LLMProvider:
@@ -122,6 +137,10 @@ class GLMClient(BaseLLMClient):
         
         for attempt in range(1, self.MAX_RETRIES + 1):
             try:
+                GLMClient._request_count += 1
+                import time
+                GLMClient._last_request_time = time.time()
+                
                 client = await self._get_client()
                 response = await client.post(
                     self.API_URL,
@@ -134,6 +153,9 @@ class GLMClient(BaseLLMClient):
                 )
                 response.raise_for_status()
                 data = response.json()
+                
+                # Log successful request with stats
+                logger.debug(f"GLM request #{GLMClient._request_count} OK (rate_limit_hits: {GLMClient._rate_limit_hits})")
                 
                 choices = data.get("choices", [])
                 if not choices:

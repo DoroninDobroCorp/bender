@@ -187,8 +187,14 @@ class BaseWorker(ABC):
                 logger.warning(f"[{self.WORKER_NAME}] No terminal emulator found. Attach manually: tmux attach -t {self.session_id}")
     
     async def stop(self) -> None:
-        """Остановить worker"""
+        """Остановить worker и закрыть терминал"""
         logger.info(f"[{self.WORKER_NAME}] Stopping session {self.session_id}")
+        
+        # Закрыть окно терминала если было открыто в visible mode
+        if self.config.visible:
+            await self._close_terminal_window()
+        
+        # Убить tmux сессию
         try:
             process = await asyncio.create_subprocess_exec(
                 "tmux", "kill-session", "-t", self.session_id,
@@ -201,6 +207,35 @@ class BaseWorker(ABC):
         
         self.status = WorkerStatus.IDLE
         self.current_task = None
+    
+    async def _close_terminal_window(self) -> None:
+        """Закрыть окно терминала с tmux сессией"""
+        import sys
+        
+        if sys.platform == "darwin":
+            # macOS - закрываем окно Terminal.app с нашей сессией
+            script = f'''
+            tell application "Terminal"
+                set windowList to windows
+                repeat with w in windowList
+                    try
+                        if name of w contains "{self.session_id}" then
+                            close w
+                        end if
+                    end try
+                end repeat
+            end tell
+            '''
+            try:
+                proc = await asyncio.create_subprocess_exec(
+                    "osascript", "-e", script,
+                    stdout=asyncio.subprocess.PIPE,
+                    stderr=asyncio.subprocess.PIPE
+                )
+                await proc.wait()
+                logger.info(f"[{self.WORKER_NAME}] Closed terminal window for session {self.session_id}")
+            except Exception as e:
+                logger.warning(f"[{self.WORKER_NAME}] Failed to close terminal: {e}")
     
     async def capture_output(self) -> str:
         """Захватить текущий вывод из tmux сессии"""

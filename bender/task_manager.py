@@ -18,7 +18,7 @@ from datetime import datetime
 from .worker_manager import WorkerManager, WorkerType, ManagerConfig
 from .log_watcher import LogWatcher, AnalysisResult, WatcherAnalysis
 from .log_filter import LogFilter
-from .glm_client import GLMClient
+from .llm_router import LLMRouter
 from .task_clarifier import TaskClarifier, TaskComplexity, ClarifiedTask
 
 logger = logging.getLogger(__name__)
@@ -129,7 +129,7 @@ class TaskManager:
 
     def __init__(
         self,
-        glm_client: GLMClient,
+        glm_client: LLMRouter,
         manager_config: ManagerConfig,
         on_status: Optional[Callable[[str], Awaitable[None]]] = None,
         on_need_human: Optional[Callable[[str], Awaitable[str]]] = None,

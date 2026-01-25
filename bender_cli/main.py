@@ -93,7 +93,16 @@ def run(ctx, task, droid, opus, codex, auto, interval, simple, visible, project)
     
     # Visible mode = always debug logging
     log_level = "DEBUG" if (ctx.obj.get('debug', False) or visible) else "INFO"
-    setup_logging(level=log_level)
+    
+    # Определяем директорию для логов
+    from pathlib import Path
+    log_dir = Path.cwd() / "logs"
+    log_dir.mkdir(exist_ok=True)
+    
+    from datetime import datetime
+    log_file = f"bender_{datetime.now().strftime('%Y%m%d_%H%M%S')}.log"
+    
+    setup_logging(level=log_level, log_dir=str(log_dir), log_file=log_file)
     
     # Determine worker type (None = auto-select)
     if codex:
@@ -141,12 +150,12 @@ async def _run_task(task: str, worker_type: Optional[str], interval: int, simple
         proj_path = Path.cwd()
     
     # Import here to avoid circular imports
-    from bender.glm_client import GLMClient
+    from bender.llm_router import LLMRouter
     from bender.task_manager import TaskManager
     from bender.worker_manager import WorkerType, ManagerConfig
     
-    # Create GLM client
-    glm = GLMClient(config.glm_api_key)
+    # Create LLM router with rate limiting (30 req/min for Cerebras free tier)
+    llm = LLMRouter(config.glm_api_key, requests_per_minute=30)
     
     # Worker type mapping (None = auto-select)
     wt = None
@@ -178,7 +187,7 @@ async def _run_task(task: str, worker_type: Optional[str], interval: int, simple
     
     # Create task manager
     _task_manager = TaskManager(
-        glm_client=glm,
+        glm_client=llm,
         manager_config=manager_config,
         on_status=on_status,
         on_need_human=on_need_human,
@@ -267,7 +276,7 @@ async def _run_task(task: str, worker_type: Optional[str], interval: int, simple
     finally:
         if _task_manager:
             await _task_manager.worker_manager.stop()
-        await glm.close()
+        await llm.close()
 
 
 @cli.command()

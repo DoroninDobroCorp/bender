@@ -10,11 +10,12 @@ Log Watcher - мониторинг и анализ логов CLI workers
 import asyncio
 import logging
 from dataclasses import dataclass
-from typing import Optional, Callable, Awaitable
+from typing import Optional, Callable, Awaitable, Union
 from enum import Enum
 
 from .log_filter import LogFilter, FilteredLog
 from .glm_client import GLMClient
+from .llm_router import LLMRouter
 from .workers.base import WorkerStatus
 from .context_manager import ContextManager
 
@@ -82,7 +83,7 @@ class LogWatcher:
 
 Ответь ТОЛЬКО JSON, без комментариев."""
 
-    def __init__(self, glm_client: GLMClient, log_filter: Optional[LogFilter] = None):
+    def __init__(self, glm_client: Union[GLMClient, LLMRouter], log_filter: Optional[LogFilter] = None):
         self.glm = glm_client
         self.filter = log_filter or LogFilter()
         self.context = ContextManager()  # NEW: управление контекстом

@@ -91,6 +91,10 @@ class LLMRouter:
         
         self._last_provider: str = "glm"
     
+    def set_usage_callback(self, callback: Callable[[int, int], None]) -> None:
+        """Установить callback для отслеживания токенов (пробрасывается в GLM клиент)"""
+        self.glm.set_usage_callback(callback)
+    
     @property
     def last_provider(self) -> str:
         return self._last_provider
