@@ -128,6 +128,10 @@ class BaseWorker(ABC):
             await process.wait()
             logger.info(f"[{self.WORKER_NAME}] Session {self.session_id} started")
             
+            # Открываем терминал если visible mode
+            if self.config.visible:
+                await self._open_terminal_window()
+            
             # Ждём загрузки CLI и отправляем задачу
             await asyncio.sleep(self.STARTUP_DELAY)
             await self.send_input(formatted_task)
@@ -137,6 +141,50 @@ class BaseWorker(ABC):
             logger.error(f"[{self.WORKER_NAME}] Failed to start: {e}")
             self.status = WorkerStatus.ERROR
             raise
+    
+    async def _open_terminal_window(self) -> None:
+        """Открыть новое окно терминала с tmux сессией"""
+        import sys
+        
+        if sys.platform == "darwin":
+            # macOS - открываем Terminal.app с tmux attach
+            script = f'''
+            tell application "Terminal"
+                activate
+                do script "tmux attach-session -t {self.session_id}"
+            end tell
+            '''
+            try:
+                proc = await asyncio.create_subprocess_exec(
+                    "osascript", "-e", script,
+                    stdout=asyncio.subprocess.PIPE,
+                    stderr=asyncio.subprocess.PIPE
+                )
+                await proc.wait()
+                logger.info(f"[{self.WORKER_NAME}] Opened terminal window for session {self.session_id}")
+            except Exception as e:
+                logger.warning(f"[{self.WORKER_NAME}] Failed to open terminal: {e}")
+        else:
+            # Linux - пробуем разные терминалы
+            terminals = [
+                ["gnome-terminal", "--", "tmux", "attach-session", "-t", self.session_id],
+                ["xterm", "-e", f"tmux attach-session -t {self.session_id}"],
+                ["konsole", "-e", f"tmux attach-session -t {self.session_id}"],
+            ]
+            for term_cmd in terminals:
+                try:
+                    proc = await asyncio.create_subprocess_exec(
+                        *term_cmd,
+                        stdout=asyncio.subprocess.PIPE,
+                        stderr=asyncio.subprocess.PIPE
+                    )
+                    # Не ждём завершения - терминал должен остаться открытым
+                    logger.info(f"[{self.WORKER_NAME}] Opened terminal window for session {self.session_id}")
+                    break
+                except FileNotFoundError:
+                    continue
+            else:
+                logger.warning(f"[{self.WORKER_NAME}] No terminal emulator found. Attach manually: tmux attach -t {self.session_id}")
     
     async def stop(self) -> None:
         """Остановить worker"""
