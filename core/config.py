@@ -18,9 +18,9 @@ class Config(BaseSettings):
         extra='ignore'
     )
     
-    # Обязательно - GLM (Cerebras) - единственный LLM
-    glm_api_key: str
-    droid_project_path: str
+    # GLM (Cerebras) - нужен только для droid worker
+    glm_api_key: Optional[str] = None
+    droid_project_path: Optional[str] = None
     
     # Алиас для glm_api_key
     cerebras_api_key: Optional[str] = None
@@ -63,8 +63,10 @@ class Config(BaseSettings):
     
     @field_validator('droid_project_path')
     @classmethod
-    def validate_project_path(cls, v: str) -> str:
+    def validate_project_path(cls, v: Optional[str]) -> Optional[str]:
         """Validate that project path exists"""
+        if v is None:
+            return None
         path = Path(v).expanduser().resolve()
         if not path.exists():
             raise ValueError(f"Project path does not exist: {path}")
@@ -111,8 +113,8 @@ class Config(BaseSettings):
         return self
     
     @property
-    def project_path(self) -> Path:
-        return Path(self.droid_project_path)
+    def project_path(self) -> Optional[Path]:
+        return Path(self.droid_project_path) if self.droid_project_path else None
     
     @property
     def logs_path(self) -> Path:
