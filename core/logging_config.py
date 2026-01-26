@@ -85,7 +85,7 @@ def setup_logging(
     
     # Console handler with colors
     console_handler = logging.StreamHandler(sys.stdout)
-    console_handler.setLevel(logging.INFO)
+    console_handler.setLevel(getattr(logging, level))  # Use same level as root
     if sys.stdout.isatty():
         console_formatter = ColoredFormatter(
             "%(asctime)s [%(levelname)s] %(name)s: %(message)s",
