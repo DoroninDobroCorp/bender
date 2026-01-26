@@ -132,10 +132,10 @@ class GLMClient(BaseLLMClient):
             LLMConnectionError: При ошибке соединения после всех retry
             LLMResponseError: При пустом ответе
         """
-        # JSON responses are usually short - limit tokens to save rate limit
+        # JSON responses - need enough tokens for thinking model's reasoning + JSON
         if json_mode:
-            prompt = f"{prompt}\n\nRespond with valid JSON only."
-            max_tokens = min(max_tokens, 1024)  # JSON rarely needs more
+            prompt = f"{prompt}\n\nВАЖНО: Ответь ТОЛЬКО валидным JSON, без рассуждений и комментариев. Сразу начни с {{"
+            max_tokens = min(max_tokens, 2048)  # Thinking models need more for reasoning
         
         last_error: Optional[Exception] = None
         prompt_preview = prompt[:100].replace('\n', ' ') + '...' if len(prompt) > 100 else prompt.replace('\n', ' ')
