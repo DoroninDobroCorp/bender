@@ -2,11 +2,12 @@
 Review Loop Manager - итеративный цикл copilot → codex → copilot
 
 Логика:
-1. Copilot выполняет задачу
-2. Codex проверяет код (BMAD роли, визуально, тесты)
-3. GLM анализирует findings и решает: исправлять или завершить
-4. Если нужно исправить → новый Copilot
-5. До MAX_ITERATIONS или пока GLM не скажет "готово"
+1. GLM анализирует задачу, формирует acceptance criteria
+2. Copilot выполняет задачу
+3. Codex/Copilot проверяет код (BMAD роли, визуально, тесты)
+4. GLM анализирует findings и решает: исправлять или завершить
+5. Если нужно исправить → новый Copilot
+6. До MAX_ITERATIONS или пока GLM не скажет "готово"
 """
 
 import asyncio
@@ -17,6 +18,7 @@ from enum import Enum
 
 from .worker_manager import WorkerManager, WorkerType, ManagerConfig
 from .llm_router import LLMRouter
+from .task_clarifier import TaskClarifier, ClarifiedTask
 
 logger = logging.getLogger(__name__)
 
@@ -85,13 +87,16 @@ FINDINGS от Codex:
 ТОЛЬКО JSON, без комментариев."""
 
 
-CODEX_REVIEW_TASK = """Проведи ДОТОШНУЮ проверку кода:
+REVIEW_TASK = """Проведи ДОТОШНУЮ проверку кода:
 
-Контекст: {context}
+Контекст задачи: {context}
+
+Критерии приёмки:
+{criteria}
 
 Проверь:
 1. Код на ошибки, баги, уязвимости
-2. Соответствие требованиям задачи
+2. Соответствие КАЖДОМУ критерию приёмки выше
 3. Запусти проект если нужно, сделай скриншоты
 4. Проверь визуально что всё работает
 5. Проанализируй с точки зрения КАЖДОЙ роли BMAD:
@@ -146,6 +151,34 @@ class ReviewLoopManager:
         if self.on_status:
             await self.on_status(f"[Loop] {message}")
     
+    async def _clarify_task(self, task: str) -> Optional[ClarifiedTask]:
+        """Уточнить задачу через GLM"""
+        try:
+            clarifier = TaskClarifier(
+                llm=self.llm,
+                project_path=self.config.project_path,
+            )
+            return await clarifier.clarify(task)
+        except Exception as e:
+            logger.warning(f"[ReviewLoop] Failed to clarify task: {e}")
+            return None
+    
+    def _format_task_with_criteria(self, clarified: ClarifiedTask) -> str:
+        """Форматировать задачу с критериями для Copilot"""
+        criteria_text = "\n".join([f"  {i+1}. {c}" for i, c in enumerate(clarified.acceptance_criteria)])
+        return f"""{clarified.clarified_task}
+
+📝 Acceptance Criteria:
+{criteria_text}
+
+Выполни ВСЕ пункты. После завершения проверь что каждый критерий выполнен."""
+    
+    def _format_criteria(self, clarified: Optional[ClarifiedTask]) -> str:
+        """Форматировать критерии для review"""
+        if not clarified or not clarified.acceptance_criteria:
+            return "Нет явных критериев"
+        return "\n".join([f"- {c}" for c in clarified.acceptance_criteria])
+    
     async def run_loop(
         self,
         task: str,
@@ -163,9 +196,20 @@ class ReviewLoopManager:
         max_iter = max_iterations or self.MAX_ITERATIONS
         total_findings = 0
         fixed_findings = 0
-        current_task = task
         
         await self._report(f"Starting review loop (max {max_iter} iterations)")
+        
+        # 0. Анализ и уточнение задачи через GLM
+        await self._report("Analyzing task with GLM...")
+        clarified = await self._clarify_task(task)
+        
+        if clarified:
+            await self._report(f"Complexity: {clarified.complexity.value}")
+            await self._report(f"Acceptance criteria: {len(clarified.acceptance_criteria)} items")
+            current_task = self._format_task_with_criteria(clarified)
+        else:
+            await self._report("Using original task (clarification failed)")
+            current_task = task
         
         for i in range(max_iter):
             if self._stop_requested:
@@ -188,7 +232,10 @@ class ReviewLoopManager:
             
             # 2. Запустить review (codex или copilot)
             await self._report(f"Running {self.reviewer_name} review...")
-            review_task = CODEX_REVIEW_TASK.format(context=task)
+            review_task = REVIEW_TASK.format(
+                context=task,
+                criteria=self._format_criteria(clarified) if clarified else "Нет критериев"
+            )
             review_output = await self._run_worker(
                 self.reviewer_type,
                 review_task,
