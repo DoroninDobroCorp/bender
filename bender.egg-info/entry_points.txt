@@ -1,3 +1,0 @@
-[console_scripts]
-bd = bender_cli.main:main
-bender = bender_cli.main:main
