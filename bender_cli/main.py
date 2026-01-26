@@ -77,10 +77,11 @@ def cli(ctx, debug):
 @click.option('--simple', '-s', is_flag=True, help='Skip clarification and verification')
 @click.option('--visible', '-v', is_flag=True, help='Show terminal windows')
 @click.option('--review-loop', '-l', is_flag=True, help='Iterative copilot→codex loop until clean')
+@click.option('--copilot-review', '-c', is_flag=True, help='Use copilot instead of codex for review (saves codex limits)')
 @click.option('--max-iterations', type=int, default=10, help='Max iterations for review loop')
 @click.option('--project', '-p', type=click.Path(exists=True), help='Project path')
 @click.pass_context
-def run(ctx, task, droid, opus, codex, auto, interval, simple, visible, review_loop, max_iterations, project):
+def run(ctx, task, droid, opus, codex, auto, interval, simple, visible, review_loop, copilot_review, max_iterations, project):
     """Run a task with Bender supervision
     
     By default, Bender will:
@@ -92,6 +93,7 @@ def run(ctx, task, droid, opus, codex, auto, interval, simple, visible, review_l
     Use --simple to skip analysis and verification.
     Use --droid or --codex to force a specific worker.
     Use --review-loop for iterative copilot→codex→copilot cycle.
+    Use --copilot-review (-c) with --review-loop to use copilot for review instead of codex.
     """
     
     # Visible mode = always debug logging
@@ -119,7 +121,8 @@ def run(ctx, task, droid, opus, codex, auto, interval, simple, visible, review_l
     
     click.echo(f"🤖 Bender starting...")
     if review_loop:
-        click.echo(f"   Mode: REVIEW LOOP (copilot→codex→copilot, max {max_iterations} iterations)")
+        reviewer = "copilot" if copilot_review else "codex"
+        click.echo(f"   Mode: REVIEW LOOP (copilot→{reviewer}→copilot, max {max_iterations} iterations)")
     elif worker_type:
         click.echo(f"   Worker: {worker_type} (forced)")
     else:
@@ -131,13 +134,13 @@ def run(ctx, task, droid, opus, codex, auto, interval, simple, visible, review_l
     click.echo()
     
     if review_loop:
-        asyncio.run(_run_review_loop(task, max_iterations, visible, project, ctx.obj.get('debug', False)))
+        asyncio.run(_run_review_loop(task, max_iterations, visible, project, copilot_review, ctx.obj.get('debug', False)))
     else:
         asyncio.run(_run_task(task, worker_type, interval, simple, visible, project, ctx.obj.get('debug', False)))
 
 
-async def _run_review_loop(task: str, max_iterations: int, visible: bool, project_path: Optional[str], debug: bool = False):
-    """Run iterative review loop: copilot → codex → copilot"""
+async def _run_review_loop(task: str, max_iterations: int, visible: bool, project_path: Optional[str], use_copilot_reviewer: bool = False, debug: bool = False):
+    """Run iterative review loop: copilot → codex/copilot → copilot"""
     global _shutdown_event
     
     _shutdown_event = asyncio.Event()
@@ -172,6 +175,7 @@ async def _run_review_loop(task: str, max_iterations: int, visible: bool, projec
         llm=llm,
         manager_config=manager_config,
         on_status=on_status,
+        use_copilot_reviewer=use_copilot_reviewer,
     )
     
     try:

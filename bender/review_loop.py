@@ -118,12 +118,23 @@ class ReviewLoopManager:
         llm: LLMRouter,
         manager_config: ManagerConfig,
         on_status: Optional[Callable[[str], Awaitable[None]]] = None,
+        use_copilot_reviewer: bool = False,
     ):
         self.llm = llm
         self.config = manager_config
         self.on_status = on_status
+        self.use_copilot_reviewer = use_copilot_reviewer
         self.history: List[LoopIteration] = []
         self._stop_requested = False
+    
+    @property
+    def reviewer_type(self) -> WorkerType:
+        """Какой воркер используем для review"""
+        return WorkerType.OPUS if self.use_copilot_reviewer else WorkerType.CODEX
+    
+    @property
+    def reviewer_name(self) -> str:
+        return "copilot" if self.use_copilot_reviewer else "codex"
     
     def request_stop(self) -> None:
         """Запросить остановку"""
@@ -175,25 +186,25 @@ class ReviewLoopManager:
             if self._stop_requested:
                 break
             
-            # 2. Запустить Codex review
-            await self._report(f"Running Codex review...")
+            # 2. Запустить review (codex или copilot)
+            await self._report(f"Running {self.reviewer_name} review...")
             review_task = CODEX_REVIEW_TASK.format(context=task)
-            codex_output = await self._run_worker(
-                WorkerType.CODEX,
+            review_output = await self._run_worker(
+                self.reviewer_type,
                 review_task,
-                f"codex-iter-{iteration_num}"
+                f"{self.reviewer_name}-iter-{iteration_num}"
             )
             
             if self._stop_requested:
                 break
             
             # 3. Парсить findings
-            findings = self._parse_findings(codex_output)
+            findings = self._parse_findings(review_output)
             total_findings += len(findings)
             
             iteration = LoopIteration(
                 iteration=iteration_num,
-                worker="codex",
+                worker=self.reviewer_name,
                 findings=findings,
             )
             
