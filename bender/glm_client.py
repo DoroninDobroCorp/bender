@@ -140,6 +140,9 @@ class GLMClient(BaseLLMClient):
         last_error: Optional[Exception] = None
         prompt_preview = prompt[:100].replace('\n', ' ') + '...' if len(prompt) > 100 else prompt.replace('\n', ' ')
         
+        # Log full prompt in debug mode
+        logger.debug(f"=== GLM PROMPT ===\n{prompt}\n=== END PROMPT ===")
+        
         for attempt in range(1, self.MAX_RETRIES + 1):
             try:
                 GLMClient._request_count += 1
@@ -189,6 +192,9 @@ class GLMClient(BaseLLMClient):
                 
                 if not content or not content.strip():
                     raise LLMResponseError("GLM returned empty response")
+                
+                # Log full response in debug mode
+                logger.debug(f"=== GLM RESPONSE ===\n{content}\n=== END RESPONSE ===")
                 
                 return content
                 
