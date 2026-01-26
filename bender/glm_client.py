@@ -135,7 +135,7 @@ class GLMClient(BaseLLMClient):
         # JSON responses - need enough tokens for thinking model's reasoning + JSON
         if json_mode:
             prompt = f"{prompt}\n\nВАЖНО: Ответь ТОЛЬКО валидным JSON, без рассуждений и комментариев. Сразу начни с {{"
-            max_tokens = min(max_tokens, 2048)  # Thinking models need more for reasoning
+            max_tokens = min(max_tokens, 8192)  # Thinking models need room for reasoning
         
         last_error: Optional[Exception] = None
         prompt_preview = prompt[:100].replace('\n', ' ') + '...' if len(prompt) > 100 else prompt.replace('\n', ' ')
