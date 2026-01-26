@@ -180,9 +180,15 @@ class GLMClient(BaseLLMClient):
                 content = message.get("content", "")
                 reasoning = message.get("reasoning", "")
                 
-                # Логируем reasoning если есть (GLM thinking)
-                if reasoning:
+                # GLM thinking models may put response in reasoning field
+                if (not content or not content.strip()) and reasoning:
+                    logger.debug(f"GLM: content empty, using reasoning field")
+                    content = reasoning
+                
+                # Логируем reasoning если есть и отличается от content
+                if reasoning and reasoning != content:
                     logger.debug(f"GLM reasoning: {reasoning[:200]}...")
+                    
                 self._session_input_tokens += input_tokens
                 self._session_output_tokens += output_tokens
                 
@@ -191,6 +197,8 @@ class GLMClient(BaseLLMClient):
                     self._on_usage(input_tokens, output_tokens)
                 
                 if not content or not content.strip():
+                    # Log full response for debugging
+                    logger.warning(f"GLM empty response, full data: {data}")
                     raise LLMResponseError("GLM returned empty response")
                 
                 # Log full response in debug mode
