@@ -39,9 +39,12 @@ class DroidWorker(BaseWorker):
     
     @property
     def cli_command(self) -> List[str]:
-        # ВСЕГДА используем droid exec для чистого вывода без TUI мусора
-        # --skip-permissions-unsafe даёт максимальные права
-        return ["droid", "exec", "--skip-permissions-unsafe"]
+        # Visible режим: интерактивный droid с TUI (пользователь видит что происходит)
+        # Background режим: droid exec (без TUI, для логов)
+        if self.config.visible:
+            return ["droid", "--auto", "high"]
+        else:
+            return ["droid", "exec", "--skip-permissions-unsafe"]
     
     def format_task(self, task: str, context: Optional[str] = None) -> str:
         self._current_task_text = task
