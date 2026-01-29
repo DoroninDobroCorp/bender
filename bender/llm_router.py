@@ -193,7 +193,15 @@ class LLMRouter:
         json_mode: bool,
         max_tokens: int = 4096
     ) -> Optional[str]:
-        """Try to generate with specific key and model"""
+        """Try to generate with specific key and model
+        
+        Returns:
+            Response string if success
+            None if transient error (can retry with another key)
+        
+        Raises:
+            RuntimeError if x-should-retry=false (don't retry with other keys)
+        """
         if model_type == "glm":
             client = self._get_glm_client(api_key)
         else:
@@ -213,6 +221,11 @@ class LLMRouter:
             if "429" in error_str or "rate limit" in error_str.lower():
                 await self.key_rotator.mark_failed(api_key)
                 self.stats["key_rotations"] += 1
+                
+                # Если x-should-retry=false - не пробовать другие ключи
+                if "retry disabled" in error_str.lower():
+                    logger.warning(f"GLM global rate limit - waiting {self.key_rotator.cooldown}s")
+                    raise RuntimeError(f"GLM rate limit, wait required")
             
             logger.warning(f"{model_type.upper()} error with key ...{api_key[-8:]}: {e}")
             return None
@@ -226,21 +239,32 @@ class LLMRouter:
     ) -> str:
         """Генерировать ответ: перебирает ключи с паузами при 429"""
         
-        last_error = None
-        
-        # Пробуем каждый ключ с паузой между попытками
+        # Пробуем каждый ключ
         for attempt in range(len(self.all_keys)):
             api_key = await self.key_rotator.get_key()
             
             # Пауза перед повторной попыткой (после первой неудачи)
             if attempt > 0:
-                wait_time = min(5, 1 + attempt)  # 2, 3, 4, max 5 секунд
+                wait_time = 10 + attempt * 5  # 10, 15, 20 секунд
                 logger.info(f"🔄 Retry {attempt + 1}/{len(self.all_keys)}, waiting {wait_time}s")
                 await asyncio.sleep(wait_time)
             
-            response = await self._try_with_key(api_key, "glm", prompt, temperature, json_mode, max_tokens)
-            if response:
-                return response
+            try:
+                response = await self._try_with_key(api_key, "glm", prompt, temperature, json_mode, max_tokens)
+                if response:
+                    return response
+            except RuntimeError as e:
+                if "wait required" in str(e):
+                    # Global rate limit - wait and retry with same key
+                    wait_time = 30  # Ждём 30 секунд
+                    logger.info(f"⏳ Global rate limit, waiting {wait_time}s before retry")
+                    await asyncio.sleep(wait_time)
+                    # Retry this key after wait
+                    response = await self._try_with_key(api_key, "glm", prompt, temperature, json_mode, max_tokens)
+                    if response:
+                        return response
+                else:
+                    raise
         
         raise RuntimeError(f"All API keys failed (tried {len(self.all_keys)} keys)")
     
