@@ -37,36 +37,35 @@ class ClarifiedTask:
 class TaskClarifier:
     """Уточнение ТЗ через GLM"""
     
-    CLARIFY_PROMPT = """Ты помощник по уточнению технических заданий.
+    CLARIFY_PROMPT = """Ты помощник по анализу технических заданий.
 
 Рабочая директория: {project_path}
-(Все относительные пути и упоминания "эта папка", "текущая директория" относятся к ней)
 
 Задача от пользователя:
 {task}
 
-Проанализируй задачу и определи:
+Твоя роль: НЕ ПЕРЕФОРМУЛИРОВАТЬ задачу, а только:
+1. Определить сложность
+2. Добавить чёткие acceptance criteria (критерии приёмки)
 
-1. **Сложность** (SIMPLE / MEDIUM / COMPLEX):
-   - SIMPLE: одно действие, понятно что делать (исправить опечатку, добавить простой файл, запустить команду)
-   - MEDIUM: несколько шагов, стандартная задача (добавить endpoint, написать тест, рефакторинг)
-   - COMPLEX: много изменений, архитектура, баги, планирование (новая фича, найти сложный баг, рефакторинг большого модуля)
+ВАЖНО:
+- Если пользователь написал "не спрашивай", "делай", "без вопросов" и т.п. - НЕ задавай вопросов!
+- НЕ переформулируй задачу - она уже сформулирована пользователем
+- Только ДОБАВЬ acceptance criteria для проверки выполнения
 
-2. **Критерии выполнения** - чёткий список пунктов, по которым можно проверить что задача выполнена
-
-3. **Нужно ли уточнение** - есть ли неясности которые надо спросить у пользователя?
-
-ВАЖНО: Не задавай вопросы ради вопросов! Задавай только если реально нужно помочь пользователю чётко сформулировать задачу и найти чёткие критерии выполнения. Если задача понятна — questions должен быть пустым [].
-
-Ответь в формате JSON:
+Ответь в JSON:
 {{
     "complexity": "SIMPLE|MEDIUM|COMPLEX",
-    "is_clear": true/false,
-    "clarified_task": "уточнённая формулировка задачи",
+    "is_clear": true,
     "acceptance_criteria": ["критерий 1", "критерий 2", ...],
-    "questions": ["вопрос 1", "вопрос 2", ...] или [] если всё ясно,
-    "needs_final_review": true/false (true если много изменений ожидается)
+    "questions": [],
+    "needs_final_review": true/false
 }}
+
+Сложность:
+- SIMPLE: одно действие (опечатка, простой файл)
+- MEDIUM: несколько шагов (endpoint, тест)  
+- COMPLEX: много изменений (новая фича, большой рефакторинг)
 """
 
     REFINE_PROMPT = """Пользователь уточнил задачу.
@@ -101,9 +100,19 @@ class TaskClarifier:
             task: Исходная задача от пользователя
             
         Returns:
-            ClarifiedTask с уточнённым ТЗ и критериями
+            ClarifiedTask с ОРИГИНАЛЬНОЙ задачей и acceptance criteria
         """
         logger.info(f"[Clarifier] Analyzing task: {task[:50]}...")
+        
+        # Проверяем есть ли указание не спрашивать
+        task_lower = task.lower()
+        skip_questions = any(phrase in task_lower for phrase in [
+            "не спрашивай", "без вопросов", "делай", "просто сделай",
+            "не задавай", "don't ask", "just do", "no questions"
+        ])
+        
+        if skip_questions:
+            logger.info("[Clarifier] User requested no questions, skipping clarification")
         
         # Первичный анализ
         prompt = self.CLARIFY_PROMPT.format(task=task, project_path=self.project_path)
@@ -114,25 +123,27 @@ class TaskClarifier:
             logger.warning(f"[Clarifier] Failed to analyze, using defaults: {e}")
             return ClarifiedTask(
                 original_task=task,
-                clarified_task=task,
+                clarified_task=task,  # ОРИГИНАЛЬНАЯ задача
                 complexity=TaskComplexity.MEDIUM,
                 acceptance_criteria=["Задача выполнена"],
             )
         
-        is_clear = result.get("is_clear", True)
         questions = result.get("questions", [])
         
-        # Если есть вопросы и есть callback для пользователя
-        if not is_clear and questions and self.on_ask_user:
+        # Спрашиваем ТОЛЬКО если:
+        # 1. Есть вопросы
+        # 2. Есть callback
+        # 3. Пользователь НЕ сказал "не спрашивай"
+        if questions and self.on_ask_user and not skip_questions:
             logger.info(f"[Clarifier] Need clarification: {len(questions)} questions")
             
-            # Спрашиваем пользователя
             answers = []
-            for q in questions[:3]:  # макс 3 вопроса
+            for q in questions[:3]:
                 answer = await self.on_ask_user(q)
                 answers.append(answer)
             
-            # Уточняем ТЗ с ответами
+            # Добавляем ответы к критериям, но НЕ переформулируем задачу
+            # Просто обновляем criteria с учётом ответов
             refine_prompt = self.REFINE_PROMPT.format(
                 original_task=task,
                 questions=questions[:3],
@@ -153,7 +164,7 @@ class TaskClarifier:
         
         clarified = ClarifiedTask(
             original_task=task,
-            clarified_task=result.get("clarified_task", task),
+            clarified_task=task,  # ВСЕГДА оригинальная задача!
             complexity=complexity,
             acceptance_criteria=result.get("acceptance_criteria", ["Задача выполнена"]),
             needs_final_review=result.get("needs_final_review", False),
