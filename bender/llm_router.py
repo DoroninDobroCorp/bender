@@ -20,34 +20,26 @@ FALLBACK_MODEL = "qwen-3-235b-a22b-instruct-2507"  # тот же, на случ�
 
 
 class RateLimiter:
-    """Simple token bucket rate limiter"""
+    """Simple rate limiter with minimum delay between requests"""
     
     def __init__(self, requests_per_minute: int = 60):
         self.requests_per_minute = requests_per_minute
-        self.tokens = requests_per_minute
-        self.last_update = time.time()
+        self.min_delay = 3.0  # Минимум 3 секунды между запросами (Cerebras строгий)
+        self.last_request = 0.0
         self._lock = asyncio.Lock()
     
     async def acquire(self):
         """Wait until a request can be made"""
         async with self._lock:
             now = time.time()
-            elapsed = now - self.last_update
+            elapsed = now - self.last_request
             
-            # Refill tokens based on elapsed time
-            self.tokens = min(
-                self.requests_per_minute,
-                self.tokens + elapsed * (self.requests_per_minute / 60)
-            )
-            self.last_update = now
-            
-            if self.tokens < 1:
-                wait_time = (1 - self.tokens) * (60 / self.requests_per_minute)
-                logger.debug(f"Rate limit: waiting {wait_time:.2f}s")
+            if elapsed < self.min_delay:
+                wait_time = self.min_delay - elapsed
+                logger.debug(f"Rate limit: waiting {wait_time:.1f}s between requests")
                 await asyncio.sleep(wait_time)
-                self.tokens = 1
             
-            self.tokens -= 1
+            self.last_request = time.time()
 
 
 class KeyRotator:
@@ -57,7 +49,7 @@ class KeyRotator:
         self.keys = keys if keys else []
         self.current_index = 0
         self.failed_keys: Dict[str, float] = {}  # key -> failure time
-        self.cooldown = 30.0  # seconds to wait before retrying failed key
+        self.cooldown = 60.0  # Cerebras нужно 60s cooldown после 429
         self._lock = asyncio.Lock()
     
     async def get_key(self) -> str:
