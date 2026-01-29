@@ -686,12 +686,20 @@ class ReviewLoopManager:
                 await worker_manager.stop()
                 
                 if action == "retry":
-                    await self._report(f"🔄 {worker_name}: {reason} - retrying...")
+                    # Проверяем лимит retry
+                    if attempt >= max_retries - 1:
+                        await self._report(f"❌ {worker_name} failed after {max_retries} retry attempts: {reason}")
+                        return output
+                    await self._report(f"🔄 {worker_name}: {reason} - retrying ({attempt + 1}/{max_retries})...")
                     await asyncio.sleep(5)
                     
                 elif action == "wait":
+                    # Проверяем лимит retry
+                    if attempt >= max_retries - 1:
+                        await self._report(f"❌ {worker_name} failed after {max_retries} wait attempts: {reason}")
+                        return output
                     wait_secs = decision.get("wait_seconds", 30)
-                    await self._report(f"⏳ {worker_name}: {reason} - waiting {wait_secs}s...")
+                    await self._report(f"⏳ {worker_name}: {reason} - waiting {wait_secs}s ({attempt + 1}/{max_retries})...")
                     await asyncio.sleep(wait_secs)
                     
                 elif action == "abort":
