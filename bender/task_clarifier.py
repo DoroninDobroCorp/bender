@@ -100,7 +100,7 @@ class TaskClarifier:
             task: Исходная задача от пользователя
             
         Returns:
-            ClarifiedTask с ОРИГИНАЛЬНОЙ задачей и acceptance criteria
+            ClarifiedTask с ОРИГИНАЛЬНОЙ задачей и acceptance criteria (только если одобрены)
         """
         logger.info(f"[Clarifier] Analyzing task: {task[:50]}...")
         
@@ -111,8 +111,16 @@ class TaskClarifier:
             "не задавай", "don't ask", "just do", "no questions"
         ])
         
+        # Если пользователь сказал не спрашивать - отправляем БЕЗ критериев
         if skip_questions:
-            logger.info("[Clarifier] User requested no questions, skipping clarification")
+            logger.info("[Clarifier] User requested no questions - sending task AS IS without criteria")
+            return ClarifiedTask(
+                original_task=task,
+                clarified_task=task,
+                complexity=TaskComplexity.COMPLEX,  # Assume complex if user knows what they want
+                acceptance_criteria=[],  # БЕЗ критериев - пусть модель сама разберётся
+                needs_final_review=True,
+            )
         
         # Первичный анализ
         prompt = self.CLARIFY_PROMPT.format(task=task, project_path=self.project_path)
@@ -120,40 +128,32 @@ class TaskClarifier:
         try:
             result = await self.llm.generate_json(prompt, temperature=0.3)
         except Exception as e:
-            logger.warning(f"[Clarifier] Failed to analyze, using defaults: {e}")
+            logger.warning(f"[Clarifier] Failed to analyze, sending task AS IS: {e}")
             return ClarifiedTask(
                 original_task=task,
-                clarified_task=task,  # ОРИГИНАЛЬНАЯ задача
+                clarified_task=task,
                 complexity=TaskComplexity.MEDIUM,
-                acceptance_criteria=["Задача выполнена"],
+                acceptance_criteria=[],  # БЕЗ критериев при ошибке
             )
         
         questions = result.get("questions", [])
+        criteria = result.get("acceptance_criteria", [])
         
-        # Спрашиваем ТОЛЬКО если:
-        # 1. Есть вопросы
-        # 2. Есть callback
-        # 3. Пользователь НЕ сказал "не спрашивай"
-        if questions and self.on_ask_user and not skip_questions:
-            logger.info(f"[Clarifier] Need clarification: {len(questions)} questions")
-            
-            answers = []
-            for q in questions[:3]:
-                answer = await self.on_ask_user(q)
-                answers.append(answer)
-            
-            # Добавляем ответы к критериям, но НЕ переформулируем задачу
-            # Просто обновляем criteria с учётом ответов
-            refine_prompt = self.REFINE_PROMPT.format(
-                original_task=task,
-                questions=questions[:3],
-                answers=answers,
+        # Спрашиваем одобрение критериев если есть callback
+        if criteria and self.on_ask_user:
+            criteria_text = "\n".join([f"  {i+1}. {c}" for i, c in enumerate(criteria)])
+            approval = await self.on_ask_user(
+                f"Предлагаемые критерии приёмки:\n{criteria_text}\n\nОдобрить? (да/нет/свои)"
             )
             
-            try:
-                result = await self.llm.generate_json(refine_prompt, temperature=0.3)
-            except Exception as e:
-                logger.warning(f"[Clarifier] Failed to refine: {e}")
+            approval_lower = approval.lower().strip()
+            if approval_lower in ["нет", "no", "n", "без критериев"]:
+                logger.info("[Clarifier] User rejected criteria - sending without them")
+                criteria = []
+            elif approval_lower not in ["да", "yes", "y", "ок", "ok", ""]:
+                # Пользователь ввёл свои критерии
+                logger.info("[Clarifier] User provided custom criteria")
+                criteria = [c.strip() for c in approval.split("\n") if c.strip()]
         
         # Парсим результат
         complexity_str = result.get("complexity", "MEDIUM").upper()
@@ -166,7 +166,7 @@ class TaskClarifier:
             original_task=task,
             clarified_task=task,  # ВСЕГДА оригинальная задача!
             complexity=complexity,
-            acceptance_criteria=result.get("acceptance_criteria", ["Задача выполнена"]),
+            acceptance_criteria=criteria,
             needs_final_review=result.get("needs_final_review", False),
         )
         

@@ -235,6 +235,10 @@ class ReviewLoopManager:
     
     def _format_task_with_criteria(self, clarified: ClarifiedTask) -> str:
         """Форматировать задачу с критериями для Copilot"""
+        # Если критериев нет - отправляем задачу как есть
+        if not clarified.acceptance_criteria:
+            return clarified.clarified_task
+        
         criteria_text = "\n".join([f"  {i+1}. {c}" for i, c in enumerate(clarified.acceptance_criteria)])
         return f"""{clarified.clarified_task}
 
