@@ -186,11 +186,11 @@ cd {shlex.quote(str(self.config.project_path))}
 script -q {shlex.quote(str(self._log_file))} {cmd_with_task}
 '''
         elif self.WORKER_NAME == "droid":
-            # droid exec использует script для захвата вывода
+            # droid exec: script -qF для немедленного flush вывода
             cmd_with_task = f'{cli_cmd} "$(cat {shlex.quote(str(task_file))})"'
             script_content = f'''#!/bin/bash
 cd {shlex.quote(str(self.config.project_path))}
-script -q {shlex.quote(str(self._log_file))} /bin/bash -c {shlex.quote(cmd_with_task)}
+script -qF {shlex.quote(str(self._log_file))} /bin/bash -c {shlex.quote(cmd_with_task)}
 '''
         else:
             # codex и другие: просто передаём как аргумент
