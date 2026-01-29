@@ -20,6 +20,7 @@ from .log_watcher import LogWatcher, AnalysisResult, WatcherAnalysis
 from .log_filter import LogFilter
 from .llm_router import LLMRouter
 from .task_clarifier import TaskClarifier, TaskComplexity, ClarifiedTask
+from .console_recovery import ConsoleRecovery
 
 logger = logging.getLogger(__name__)
 
@@ -150,6 +151,7 @@ class TaskManager:
             on_ask_user=on_need_human,
             project_path=str(manager_config.project_path),
         )
+        self._console_recovery = ConsoleRecovery()
         
         # Connect GLM token tracking to context manager
         self.glm.set_usage_callback(self.log_watcher.context.add_llm_usage)
@@ -198,6 +200,7 @@ class TaskManager:
         self._history = []
         self._accumulated_log = ""
         self._nudge_count = 0
+        self._console_recovery.reset()
         
         start_time = asyncio.get_event_loop().time()
         
@@ -420,6 +423,35 @@ class TaskManager:
             # Захватить и проанализировать лог
             raw_log = await self.worker_manager.current_worker.capture_output()
             elapsed = self.worker_manager.current_worker.get_elapsed_time()
+
+            # Проверить, жива ли сессия на уровне tmux/терминала
+            try:
+                session_alive = await self.worker_manager.current_worker.is_session_alive()
+            except Exception:
+                session_alive = True
+            if not session_alive:
+                recovered = await self._attempt_console_recovery("Сессия терминала не отвечает", raw_log)
+                if recovered:
+                    continue
+                return WatcherAnalysis(
+                    result=AnalysisResult.ERROR,
+                    summary="Worker session died",
+                    suggestion="Restart worker",
+                    should_restart=True,
+                )
+
+            # Консольные ошибки — пытаемся мягко восстановить
+            console_issue = self._console_recovery.detect_issue(raw_log)
+            if console_issue:
+                recovered = await self._attempt_console_recovery(console_issue, raw_log)
+                if recovered:
+                    continue
+                return WatcherAnalysis(
+                    result=AnalysisResult.ERROR,
+                    summary="Console error persisted",
+                    suggestion="Restart worker",
+                    should_restart=True,
+                )
             
             analysis = await self.log_watcher.analyze(
                 raw_log=raw_log,
@@ -454,9 +486,26 @@ class TaskManager:
             
             # ERROR - restart
             if analysis.result == AnalysisResult.ERROR:
+                console_issue = self._console_recovery.detect_issue(raw_log)
+                if console_issue:
+                    recovered = await self._attempt_console_recovery(console_issue, raw_log)
+                    if recovered:
+                        continue
                 return analysis
             
             # WORKING - продолжаем мониторинг
+
+    async def _attempt_console_recovery(self, reason: str, output: str) -> bool:
+        """Попробовать восстановить консоль через мягкий nudge"""
+        worker = self.worker_manager.current_worker
+        if not worker:
+            return False
+        return await self._console_recovery.attempt_recovery(
+            worker=worker,
+            on_status=self._report_status,
+            reason=reason,
+            output=output,
+        )
     
     def _collect_token_stats(self, worker_type: WorkerType) -> tuple[int, int, int]:
         """Собрать статистику токенов"""

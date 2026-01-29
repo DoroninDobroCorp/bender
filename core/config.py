@@ -24,6 +24,7 @@ class Config(BaseSettings):
     
     # GLM (Cerebras) - нужен только для droid worker
     glm_api_key: Optional[str] = None
+    glm_api_keys: Optional[str] = None  # Comma-separated list for rotation
     droid_project_path: Optional[str] = None
     
     # Алиас для glm_api_key
@@ -127,6 +128,17 @@ class Config(BaseSettings):
     @property
     def state_path(self) -> Path:
         return Path(self.state_dir)
+    
+    @property
+    def api_keys_list(self) -> List[str]:
+        """Get list of API keys for rotation"""
+        if self.glm_api_keys:
+            keys = [k.strip() for k in self.glm_api_keys.split(',') if k.strip()]
+            if keys:
+                return keys
+        if self.glm_api_key:
+            return [self.glm_api_key]
+        return []
     
     def get_validation_errors(self) -> List[str]:
         """Get list of validation warnings (non-fatal issues)"""

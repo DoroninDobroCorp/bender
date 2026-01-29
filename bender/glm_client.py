@@ -1,20 +1,41 @@
 """
-GLM API Client (Cerebras) - Fallback для Gemini
+GLM API Client (Cerebras) - Primary LLM for Bender
 """
 
 import asyncio
+import json
 import logging
+import re
 from typing import Dict, Any, Optional, Callable
 from dataclasses import dataclass
+from enum import Enum
 
 import httpx
 
-from .base_client import BaseLLMClient, LLMProvider
 from .utils import parse_json_response, JSONParseError
-from core.exceptions import LLMResponseError, LLMConnectionError
 
 
 logger = logging.getLogger(__name__)
+
+
+class LLMConnectionError(Exception):
+    """Error connecting to LLM API"""
+    pass
+
+
+class LLMResponseError(Exception):
+    """Error in LLM response"""
+    pass
+
+
+def clean_surrogates(text: str) -> str:
+    """Remove or replace surrogate characters that can't be encoded in UTF-8"""
+    if not text:
+        return text
+    try:
+        return text.encode('utf-8', errors='replace').decode('utf-8')
+    except Exception:
+        return ''.join(char for char in text if not (0xD800 <= ord(char) <= 0xDFFF))
 
 
 @dataclass
@@ -28,7 +49,7 @@ class LLMUsage:
         return self.input_tokens + self.output_tokens
 
 
-class GLMClient(BaseLLMClient):
+class GLMClient:
     """Клиент для GLM API (Cerebras)
     
     Основной LLM провайдер.
@@ -47,8 +68,8 @@ class GLMClient(BaseLLMClient):
     _last_request_time: float = 0
     
     def __init__(self, api_key: str, model_name: Optional[str] = None):
-        model = model_name or self.DEFAULT_MODEL
-        super().__init__(api_key, model)
+        self.api_key = api_key
+        self.model_name = model_name or self.DEFAULT_MODEL
         self._client: Optional[httpx.AsyncClient] = None
         # Session token tracking
         self._session_input_tokens: int = 0
@@ -76,11 +97,6 @@ class GLMClient(BaseLLMClient):
             "tokens_in": self._session_input_tokens,
             "tokens_out": self._session_output_tokens,
         }
-    
-    @property
-    def provider(self) -> LLMProvider:
-        """Return the provider type"""
-        return LLMProvider.GLM
     
     async def _get_client(self) -> httpx.AsyncClient:
         """Get or create reusable HTTP client"""
@@ -132,6 +148,11 @@ class GLMClient(BaseLLMClient):
             LLMConnectionError: При ошибке соединения после всех retry
             LLMResponseError: При пустом ответе
         """
+        # ВАЖНО: Очищаем surrogate символы ПЕРЕД отправкой в API
+        # Без этого получим ошибку: 'utf-8' codec can't encode character
+        # Surrogate символы могут попасть из вывода tmux или других источников
+        prompt = clean_surrogates(prompt)
+        
         # JSON responses - need enough tokens for thinking model's reasoning + JSON
         if json_mode:
             prompt = f"{prompt}\n\nВАЖНО: Ответь ТОЛЬКО валидным JSON, без рассуждений и комментариев. Сразу начни с {{"
@@ -180,8 +201,38 @@ class GLMClient(BaseLLMClient):
                 content = message.get("content", "")
                 reasoning = message.get("reasoning", "")
                 
-                # GLM thinking models may put response in reasoning field
-                if (not content or not content.strip()) and reasoning:
+                # GLM thinking models: content may be empty, answer is in reasoning
+                # For JSON mode: try to extract JSON from reasoning if content is empty/invalid
+                if json_mode:
+                    # First try content
+                    if content and content.strip() and '{' in content:
+                        pass  # content looks like it has JSON, use it
+                    elif reasoning and '{' in reasoning:
+                        # Try to extract JSON from reasoning
+                        logger.debug(f"GLM: JSON mode - extracting from reasoning field")
+                        # Find the last JSON object in reasoning (usually the answer)
+                        json_matches = list(re.finditer(r'\{[^{}]*\}', reasoning, re.DOTALL))
+                        # Also try to find nested JSON
+                        brace_start = reasoning.rfind('{')
+                        if brace_start != -1:
+                            # Extract from last { to matching }
+                            depth = 0
+                            for i, char in enumerate(reasoning[brace_start:]):
+                                if char == '{':
+                                    depth += 1
+                                elif char == '}':
+                                    depth -= 1
+                                    if depth == 0:
+                                        potential_json = reasoning[brace_start:brace_start+i+1]
+                                        try:
+                                            json.loads(potential_json)
+                                            content = potential_json
+                                            logger.debug(f"GLM: extracted JSON from reasoning")
+                                            break
+                                        except json.JSONDecodeError:
+                                            pass
+                elif (not content or not content.strip()) and reasoning:
+                    # Non-JSON mode: use reasoning as content
                     logger.debug(f"GLM: content empty, using reasoning field")
                     content = reasoning
                 
@@ -213,6 +264,12 @@ class GLMClient(BaseLLMClient):
                 last_error = e
                 logger.warning(f"GLM HTTP error {e.response.status_code} (attempt {attempt}/{self.MAX_RETRIES})")
                 if e.response.status_code == 429:
+                    GLMClient._rate_limit_hits += 1
+                    # Check x-should-retry header - if false, don't retry
+                    should_retry = e.response.headers.get("x-should-retry", "true").lower()
+                    if should_retry == "false":
+                        logger.warning("GLM rate limit hit, x-should-retry=false, skipping retries")
+                        raise LLMConnectionError(f"GLM rate limit exceeded (429), retry disabled by server")
                     await asyncio.sleep(self.RETRY_DELAY * attempt * 2)
                     continue
             except Exception as e:
@@ -227,10 +284,11 @@ class GLMClient(BaseLLMClient):
     async def generate_json(
         self,
         prompt: str,
-        temperature: float = 0.3
+        temperature: float = 0.3,
+        max_tokens: int = 4096
     ) -> Dict[str, Any]:
         """Генерировать JSON ответ"""
-        response = await self.generate(prompt, temperature, json_mode=True)
+        response = await self.generate(prompt, temperature, json_mode=True, max_tokens=max_tokens)
         try:
             return parse_json_response(response)
         except JSONParseError:
@@ -249,6 +307,9 @@ class GLMClient(BaseLLMClient):
         Returns:
             Tuple[content, reasoning]
         """
+        # Clean surrogate characters from prompt
+        prompt = clean_surrogates(prompt)
+        
         last_error: Optional[Exception] = None
         
         for attempt in range(1, self.MAX_RETRIES + 1):
@@ -296,6 +357,11 @@ class GLMClient(BaseLLMClient):
                 last_error = e
                 logger.warning(f"GLM HTTP error {e.response.status_code} (attempt {attempt}/{self.MAX_RETRIES})")
                 if e.response.status_code == 429:
+                    GLMClient._rate_limit_hits += 1
+                    should_retry = e.response.headers.get("x-should-retry", "true").lower()
+                    if should_retry == "false":
+                        logger.warning("GLM rate limit hit, x-should-retry=false, skipping retries")
+                        raise LLMConnectionError(f"GLM rate limit exceeded (429), retry disabled by server")
                     await asyncio.sleep(self.RETRY_DELAY * attempt * 2)
                     continue
             except Exception as e:

@@ -1,423 +1,212 @@
-# Parser Maker - Архитектура
+# Bender - Architecture
 
-## Общая схема
+## Overview
+
+Bender is a supervisor for AI CLI tools (GitHub Copilot, Droid, Codex). It doesn't solve tasks itself - it orchestrates workers and ensures quality through review loops.
 
 ```
 ┌─────────────────────────────────────────────────────────────┐
-│                      PARSER MAKER                           │
-├─────────────────────────────────────────────────────────────┤
-│  User Interface (CLI / Telegram)                            │
-│  └─ Режимы: visible (видно всё) / silent (только результат) │
-├─────────────────────────────────────────────────────────────┤
-│  Pipeline Orchestrator                                      │
-│  ├─ Step Manager (6 шагов)                                  │
-│  ├─ Git Manager (commit/push при открытии нового чата)      │
-│  └─ State Persistence                                       │
-├─────────────────────────────────────────────────────────────┤
-│  Bender (Gemini + GLM fallback) - "Программист-помощник"    │
-│  ├─ Watchdog (завис? зациклился? вылетел?)                  │
-│  ├─ Response Analyzer (сделал изменения или нет?)           │
-│  ├─ Task Enforcer (настаивает на завершении ТЗ)             │
-│  └─ Human Escalation (в крайнем случае)                     │
-├─────────────────────────────────────────────────────────────┤
-│  Droid Controller                                           │
-│  ├─ Session Manager (tmux)                                  │
-│  └─ Output Parser                                           │
+│  User: bender run -lvI "Add OAuth"                          │
+└─────────────────────────────────────────────────────────────┘
+                          │
+                          ▼
+┌─────────────────────────────────────────────────────────────┐
+│  CLI (bender_cli/main.py)                                   │
+│  Parse options → Select mode → Start async runner           │
+└─────────────────────────────────────────────────────────────┘
+                          │
+          ┌───────────────┴───────────────┐
+          ▼                               ▼
+┌─────────────────────┐         ┌─────────────────────┐
+│  TaskManager        │         │  ReviewLoopManager  │
+│  (single task)      │         │  (iterative cycle)  │
+└─────────────────────┘         └─────────────────────┘
+          │                               │
+          └───────────────┬───────────────┘
+                          ▼
+┌─────────────────────────────────────────────────────────────┐
+│  WorkerManager                                              │
+│  ├─ CopilotWorker (non-interactive, -p mode)                │
+│  ├─ InteractiveCopilotWorker (interactive, tmux session) ⭐ │
+│  ├─ DroidWorker                                             │
+│  └─ CodexWorker                                             │
+└─────────────────────────────────────────────────────────────┘
+                          │
+                          ▼
+┌─────────────────────────────────────────────────────────────┐
+│  tmux session                                               │
+│  ├─ Full scrollback (5000 lines)                            │
+│  ├─ Terminal.app window (visible mode)                      │
+│  └─ Survives bender crash (can continue manually)           │
 └─────────────────────────────────────────────────────────────┘
 ```
 
-## Ключевая логика: кто что решает
+## Key Components
 
-| Вопрос | Кто отвечает |
-|--------|--------------|
-| "Сделал ли я изменения?" | **Droid** |
-| "Были ли изменения существенными?" | **Bender (Gemini)** |
-| "Завис/зациклился/вылетел?" | **Bender (Gemini)** |
-| "Выполнено ли ТЗ шага?" | **Droid** (Bender проверяет ответ) |
-| "Переходить на следующий шаг?" | **Система** (после 2x "нет изменений") |
+### 1. Workers
 
-## Ключевые компоненты
+| Worker | Mode | Use Case |
+|--------|------|----------|
+| `CopilotWorker` | Non-interactive (`copilot -p`) | Quick tasks, batch mode |
+| `InteractiveCopilotWorker` | Interactive (tmux) | Full terminal, can continue manually |
+| `DroidWorker` | tmux | Simple tasks |
+| `CodexWorker` | tmux | Complex tasks, code review |
 
-### 1. Droid Controller
-Управляет Factory Droid через tmux. Только дорогая модель, без переключений.
+### 2. InteractiveCopilotWorker (New!)
 
-### 2. Bender (Gemini + GLM fallback)
-**Роль: программист-помощник который следит за процессом.**
-
-**Primary:** Gemini API (gemini-2.5-pro, gemini-3-pro, gemini-3-flash)
-**ВАЖНО:** Названия моделей НЕ МЕНЯТЬ - проверены и существуют на январь 2025
-**Fallback:** GLM-4.6+ - при недоступности Gemini. Llama модели ЗАПРЕЩЕНЫ.
-
-Задачи Bender:
-- **Watchdog**: мониторит что Droid не завис, не зациклился, не вылетел
-- **Response Analyzer**: понимает ответы Droid - были изменения или нет
-- **Task Enforcer**: если ТЗ не выполнено - настаивает на завершении
-- **Helper**: если проблема - помогает как программист (перезапуск, новый чат)
-- **Escalation**: в крайнем случае спрашивает человека (нежелательно до финиша)
-
-### 3. Pipeline Orchestrator
-Координирует 6 шагов. Git commit/push только при открытии нового чата (после существенных изменений).
-
-### 4. Git Manager
-Git операции выполняются **только при открытии нового чата** (после существенных изменений):
-- `git add .`
-- `git commit -m "Step N, iteration M"`
-- `git push`
-- При ошибке push (конфликты, нет сети) - эскалация к человеку
-
-### 5. State Persistence
-Сохраняет состояние. Можно продолжить после сбоя.
-
-### 6. Mid-Iteration Recovery
-**Проблема:** Сбой посреди итерации (после изменений Droid, но до коммита).
-
-**Стратегия восстановления:**
-1. При старте проверяем `git status` - есть ли uncommitted changes
-2. Если есть uncommitted changes:
-   - Сохраняем их в stash: `git stash push -m "recovery_step_N_iter_M"`
-   - Записываем в state что есть stash для recovery
-3. При resume:
-   - Проверяем есть ли recovery stash в state
-   - Если да - применяем: `git stash pop`
-   - Открываем новый чат и просим Droid проверить/доделать
-4. Альтернатива: автоматический commit с пометкой `[WIP]` перед каждой операцией Droid
-
-## Flow выполнения одного шага
-
-```
-┌──────────────────────────────────────────────────────────────────┐
-│                         ШАГ N                                    │
-└──────────────────────────────────────────────────────────────────┘
-                              │
-                              ▼
-┌──────────────────────────────────────────────────────────────────┐
-│  Bender запускает Droid, даёт ТЗ шага                            │
-└──────────────────────────────────────────────────────────────────┘
-                              │
-          ┌───────────────────┼───────────────────┐
-          │                   │                   │
-          ▼                   ▼                   ▼
-    ┌──────────┐        ┌──────────┐        ┌──────────┐
-    │ Завис?   │        │Зациклился│        │ Вылетел? │
-    └────┬─────┘        └────┬─────┘        └────┬─────┘
-         │                   │                   │
-         └───────────────────┼───────────────────┘
-                             │
-                    Bender помогает как программист
-                    (перезапуск, новый чат, пинок)
-                             │
-                             ▼
-┌──────────────────────────────────────────────────────────────────┐
-│  Droid работает... Bender следит за логами                       │
-└──────────────────────────────────────────────────────────────────┘
-                             │
-                             ▼
-┌──────────────────────────────────────────────────────────────────┐
-│  Droid отвечает: "Сделал изменения X, Y, Z" или "Всё ок"         │
-└──────────────────────────────────────────────────────────────────┘
-                             │
-                             ▼
-┌──────────────────────────────────────────────────────────────────┐
-│  Bender анализирует ответ:                                       │
-│  - ТЗ выполнено? Если нет → настаивает на завершении             │
-│  - Были изменения? Существенные или косметические?               │
-└──────────────────────────────────────────────────────────────────┘
-                             │
-              ┌──────────────┴──────────────┐
-              │                             │
-              ▼                             ▼
-┌─────────────────────────┐    ┌─────────────────────────┐
-│ Существенные изменения  │    │ "Всё ок, без изменений" │
-│ или ТЗ не выполнено     │    │ (ТЗ выполнено)          │
-└───────────┬─────────────┘    └───────────┬─────────────┘
-            │                              │
-            ▼                              ▼
-┌─────────────────────────┐    ┌─────────────────────────┐
-│ git commit + push       │    │ confirmations++         │
-│ confirmations = 0       │    │ (сохраняется в state)   │
-│ Новый чат, тот же промпт│    │                         │
-└───────────┬─────────────┘    │ confirmations >= 2?     │
-            │                  └───────────┬─────────────┘
-            │                              │
-            │                    ┌─────────┴─────────┐
-            │                    │                   │
-            │                    ▼                   ▼
-            │              conf < 2            conf >= 2
-            │                    │                   │
-            │                    ▼                   ▼
-            │         ┌──────────────────┐  ┌──────────────────┐
-            │         │ Продолжаем       │  │ ПЕРЕХОД НА       │
-            │         │ (без нового чата)│  │ ШАГ N+1          │
-            │         └────────┬─────────┘  └──────────────────┘
-            │                  │
-            └──────────────────┘
-                     │
-                     ▼
-              (повторяем цикл)
-```
-
-## Детали работы Bender
-
-### Watchdog - следит за здоровьем Droid
-
-| Проблема | Как детектит | Что делает |
-|----------|--------------|------------|
-| **Завис** | Нет output N секунд (проверка каждые 5 мин) | Bender читает логи и решает: ждать/пинать/перезапуск. Таймаут 1 час (12 проверок) |
-| **Зациклился** | Одинаковые сообщения 3+ раз | Открывает новый чат |
-| **Вылетел** | Процесс tmux умер | Перезапускает Droid |
-| **Ошибка** | Exception/Error в логах | Просит исправить. После лимита попыток - эскалация к человеку |
-
-### Response Analyzer - понимает ответы Droid
-
-Bender (Gemini) читает ответ Droid и определяет:
-1. **Выполнено ли ТЗ?** - если нет, настаивает на завершении
-2. **Были ли изменения?** - Droid сам говорит
-3. **Существенные или косметические?** - Bender оценивает по описанию
-
-### Task Enforcer - настаивает на завершении
-
-Если Droid не закончил ТЗ:
-- "ТЗ требует X, ты сделал только Y. Заверши задачу."
-- "Покажи что именно ты изменил."
-- "Запусти и покажи что работает."
-- **Лимит попыток настаивания** - после N неудач эскалация к человеку
-
-### Human Escalation - крайний случай
-
-Bender помнит что может спросить человека, но:
-- Старается не беспокоить до финиша всех 6 шагов
-- Эскалирует только если совсем застрял (5+ неудачных попыток)
-
-## Режимы отображения
-
-### Visible Mode (по умолчанию)
-- Видны мысли Bender (что он думает, какие решения принимает)
-- Виден output Droid
-- Видны git операции
-- Полный лог в реальном времени
-
-### Silent Mode
-- Только прогресс: "Шаг 2/6, итерация 3"
-- Уведомления о проблемах
-- Финальный результат
-
-## Протокол общения Bender ↔ Droid
-
-### Как Bender общается с Droid
-
-```
-┌─────────────────────────────────────────────────────────────────┐
-│  Bender (Gemini 2.5 Pro / 3 Pro / 3 Flash)                      │
-│  ├─ Формирует промпт шага                                       │
-│  ├─ Отправляет через DroidController.send()                     │
-│  ├─ Получает output                                             │
-│  └─ Анализирует ответ (были изменения? ТЗ выполнено?)           │
-└─────────────────────────────────────────────────────────────────┘
-                              │
-                              ▼
-┌─────────────────────────────────────────────────────────────────┐
-│  Droid Controller (tmux)                                        │
-│  ├─ send(prompt) → ждёт ответа                                  │
-│  ├─ Автоматический approve на approval requests                 │
-│  ├─ new_chat() → /new для свежего контекста                     │
-│  └─ Возвращает полный output                                    │
-└─────────────────────────────────────────────────────────────────┘
-```
-
-### Цикл одной итерации
+The star of the show. Key features:
 
 ```python
-# Псевдокод
-async def run_iteration(step_prompt):
-    # 1. Отправить промпт Droid
-    output = await droid.send(step_prompt)
-    
-    # 2. Bender анализирует ответ
-    analysis = await bender.analyze_response(output, step_prompt)
-    
-    # 3. Решение
-    if analysis.task_not_complete:
-        # Настоять на завершении
-        output = await droid.send("ТЗ не выполнено. Заверши: " + analysis.missing)
-        analysis = await bender.analyze_response(output, step_prompt)
-    
-    if analysis.has_substantial_changes:
-        # Были изменения → новый чат → git commit → повторить
-        await droid.new_chat()
-        await git.commit_and_push(f"Step {step}, iteration {iter}")
-        return "CONTINUE", confirmations=0
-    
-    if analysis.all_ok_no_changes:
-        # "Всё ок" → confirmations++ (сохраняется в state)
-        state.confirmations += 1
-        await state.save()
-        if state.confirmations >= 2:
-            return "NEXT_STEP"
-        # Продолжаем без нового чата
-        return "CONTINUE", state.confirmations
+class InteractiveCopilotWorker:
+    # Runs copilot in interactive mode (no -p flag)
+    # Uses tmux with large scrollback
+    # Auto-responds to permission prompts
+    # Reports status every N seconds
+    # Session survives bender crash
 ```
 
-### Формат ответа Droid (ожидаемый)
+**How it works:**
+1. Creates tmux session with `copilot` (interactive mode)
+2. Opens Terminal.app window with `tmux attach`
+3. Sends task via `tmux send-keys`
+4. Monitors output via `tmux capture-pane`
+5. Detects permission prompts → auto-responds 'y'
+6. Detects completion markers → marks task complete
+7. On stop: keeps session running (user can continue)
 
-Droid сам говорит что сделал. Bender ищет в ответе:
-- **Изменения**: "Я изменил...", "Добавил...", "Исправил...", "Updated...", "Fixed..."
-- **Всё ок**: "Всё работает", "Ничего не менял", "Already correct", "No changes needed"
-- **Ошибки**: "Error", "Exception", "Failed", "Не удалось"
+### 3. ReviewLoopManager
 
-Если непонятно - Bender спрашивает напрямую:
-```
-"Ты сделал какие-то изменения в коде? Если да - опиши какие. Если нет - скажи что всё уже работает."
-```
-
-## Bender System Prompt
-
-```
-Ты - Bender, программист который следит за работой Droid (AI-кодера).
-
-ТВОЯ РОЛЬ:
-- Следить что Droid не завис, не зациклился, не вылетел
-- Понимать его ответы: сделал изменения или нет
-- Настаивать на завершении ТЗ если не закончил
-- Помогать если проблема (перезапуск, новый чат)
-- В КРАЙНЕМ случае спросить человека (нежелательно до финиша всех шагов)
-
-КОНТЕКСТ ИТЕРАЦИИ:
-- Шаг: {step_number}/6 ({step_name})
-- Итерация: {iteration}
-- Confirmations подряд (без изменений): {confirmations}/2
-- Неудачных попыток подряд: {failed_attempts}
-- Последние действия: {last_actions}
-
-ТЗ ШАГА:
-{step_prompt}
-
-КРИТЕРИИ ВЫПОЛНЕНИЯ (из промпта шага):
-{completion_criteria}
-
-ОТВЕТ DROID:
-{droid_output}
-
-ТВОЯ ЗАДАЧА - проанализировать и ответить JSON:
-```json
-{
-  "task_complete": true|false,
-  "has_changes": true|false,
-  "changes_substantial": true|false,
-  "changes_description": "что именно изменил (если есть)",
-  "issues": ["проблема 1", "проблема 2"],
-  "action": "CONTINUE|ASK_DROID|ENFORCE_TASK|NEW_CHAT|ESCALATE",
-  "message_to_droid": "если нужно что-то сказать Droid",
-  "reason": "почему такое решение"
-}
-```
-
-ПРАВИЛА ОПРЕДЕЛЕНИЯ ИЗМЕНЕНИЙ:
-1. Существенные изменения (has_changes=true, changes_substantial=true):
-   - Новый код, новые файлы
-   - Изменение логики, алгоритмов
-   - Исправление багов
-   - Добавление/удаление функционала
-2. Несущественные изменения (has_changes=true, changes_substantial=false):
-   - Typo, formatting, whitespace
-   - Только комментарии (без кода)
-   - Переименование без изменения логики
-3. Нет изменений (has_changes=false):
-   - "Всё работает", "Already correct", "No changes needed"
-   - Droid только проверил и подтвердил
-
-ПРАВИЛА ДЕЙСТВИЙ:
-1. task_complete=true + has_changes=false → action="CONTINUE" (confirmations++)
-2. task_complete=true + changes_substantial=true → action="NEW_CHAT" (git commit, новый чат, confirmations=0)
-3. task_complete=true + changes_substantial=false → action="CONTINUE" (без нового чата)
-4. task_complete=false → action="ENFORCE_TASK"
-5. Непонятно сделал ли изменения → action="ASK_DROID"
-6. failed_attempts >= 5 → action="ESCALATE"
-
-ВАЖНО О GIT:
-- При action="NEW_CHAT" система сделает git commit перед открытием нового чата
-- Это сохраняет прогресс и позволяет откатиться при проблемах
-
-МОДЕЛЬ: Используй ТОЛЬКО gemini-2.5-pro, gemini-3-pro или gemini-3-flash. Другие модели ЗАПРЕЩЕНЫ.
-# ВАЖНО: Названия моделей НЕ МЕНЯТЬ - проверены и существуют на январь 2025
-FALLBACK: При недоступности Gemini API - использовать GLM-4.6 или выше. Llama модели ЗАПРЕЩЕНЫ.
-```
-
-## 6 шагов создания парсера
-
-> **TODO:** Промпты шагов будут добавлены отдельно.
-> Каждый промпт содержит:
-> - Название шага
-> - Описание задачи
-> - Критерии выполнения (по ним Bender проверяет)
-> - Примеры ожидаемого результата
-
-| Шаг | Название | Описание |
-|-----|----------|----------|
-| 1 | *TODO* | *Промпт будет добавлен* |
-| 2 | *TODO* | *Промпт будет добавлен* |
-| 3 | *TODO* | *Промпт будет добавлен* |
-| 4 | *TODO* | *Промпт будет добавлен* |
-| 5 | *TODO* | *Промпт будет добавлен* |
-| 6 | *TODO* | *Промпт будет добавлен* |
-
-**Файл:** `steps/parser_steps.yaml` - сюда добавить промпты
-
-## Структура проекта
+Iterative cycle: copilot → reviewer → copilot until clean.
 
 ```
-parser_maker/
-├── core/                 # Базовая инфраструктура
-│   ├── config.py         # Конфигурация
-│   └── droid_controller.py
-├── pipeline/             # 6-шаговый pipeline
-│   ├── step.py           # Определение шагов
-│   ├── orchestrator.py   # Координация
-│   └── git_manager.py    # Git операции
-├── bender/               # Программист-помощник (Gemini + GLM)
-│   ├── llm_router.py     # Роутер между провайдерами
-│   ├── gemini_client.py  # Клиент Gemini API
-│   ├── glm_client.py     # Клиент GLM API (fallback)
-│   ├── watchdog.py       # Мониторинг здоровья
-│   ├── analyzer.py       # Анализ ответов
-│   ├── enforcer.py       # Настаивание на ТЗ
-│   └── supervisor.py     # Главный класс
-├── state/                # Persistence
-│   ├── persistence.py
-│   └── recovery.py
-├── cli/                  # Интерфейс
-│   ├── main.py
-│   └── display.py        # Visible/Silent режимы
-├── steps/                # Конфигурация шагов
-│   └── parser_steps.yaml
-└── integrations/         # Telegram и др.
-    ├── telegram.py
-    └── notifications.py  # Desktop notifications fallback
+Iteration 1:
+├─ Copilot executes task
+├─ Reviewer (codex/copilot) checks code
+├─ GLM analyzes findings
+└─ Decision: fix/skip/done
+
+If fix:
+├─ Copilot fixes issues
+└─ Back to reviewer...
+
+Until done or max iterations
 ```
 
-## Формат parser_steps.yaml
+### 4. LLM Router
 
-```yaml
-# steps/parser_steps.yaml
+GLM (Cerebras) as primary, Qwen as fallback:
 
-steps:
-  - id: 1
-    name: "Название шага 1"
-    prompt_template: |
-      Твоё ТЗ:
-      ...
-      
-      Критерии выполнения:
-      - [ ] Критерий 1
-      - [ ] Критерий 2
-      
-      Когда закончишь - скажи что сделал или что всё уже работает.
-    completion_criteria:
-      - "Критерий 1"
-      - "Критерий 2"
-    
-  - id: 2
-    name: "Название шага 2"
-    # ...
+```python
+class LLMRouter:
+    # Primary: GLM (zai-glm-4.7) - thinking model
+    # Fallback: Qwen (qwen-3-235b-a22b-instruct-2507)
+    # API key rotation for rate limits
+    # Auto-retry with exponential backoff
 ```
 
-**Важно:** В `prompt_template` должны быть явные критерии выполнения - по ним Bender проверяет.
+## Data Flow
+
+### Standard Mode
+
+```
+User → TaskManager → WorkerManager → CopilotWorker → tmux → copilot
+                                            ↓
+                                      capture output
+                                            ↓
+                                    LogWatcher → LLM analysis
+                                            ↓
+                                      nudge if stuck
+```
+
+### Interactive Mode
+
+```
+User → ReviewLoopManager → WorkerManager → InteractiveCopilotWorker
+                                                    ↓
+                                              tmux session
+                                                    ↓
+                                           Terminal.app window
+                                                    ↓
+                                           User sees everything
+                                                    ↓
+                               ┌─────────────────────────────────────┐
+                               │  Monitor loop (every 2s):           │
+                               │  ├─ capture-pane → read output      │
+                               │  ├─ detect permissions → auto 'y'   │
+                               │  ├─ detect questions → ask human    │
+                               │  ├─ detect completion → mark done   │
+                               │  └─ status report (every 30s)       │
+                               └─────────────────────────────────────┘
+```
+
+## File Structure
+
+```
+bender/
+├── bender/                    # Core logic
+│   ├── __init__.py            # Exports
+│   ├── glm_client.py          # Cerebras API client
+│   ├── llm_router.py          # GLM + Qwen routing
+│   ├── worker_manager.py      # Worker lifecycle
+│   ├── task_manager.py        # Single task runner
+│   ├── task_clarifier.py      # Task analysis + criteria
+│   ├── review_loop.py         # Iterative review cycle
+│   ├── log_watcher.py         # Output analysis
+│   ├── log_filter.py          # Output filtering
+│   ├── context_manager.py     # Token budget
+│   ├── utils.py               # Helpers
+│   └── workers/
+│       ├── base.py            # BaseWorker abstract class
+│       ├── copilot.py         # Non-interactive copilot
+│       ├── interactive_copilot.py  # Interactive copilot ⭐
+│       ├── droid.py           # Droid worker
+│       └── codex.py           # Codex worker
+│
+├── bender_cli/                # CLI interface
+│   └── main.py                # Click commands
+│
+├── core/                      # Configuration
+│   ├── config.py              # Load .env
+│   ├── exceptions.py          # Custom exceptions
+│   └── logging_config.py      # Logging setup
+│
+└── tests/                     # Tests
+    ├── test_bender.py
+    └── test_core.py
+```
+
+## Key Design Decisions
+
+### 1. tmux over subprocess
+- Full terminal emulation
+- Scrollback history
+- Survives parent process crash
+- User can attach and continue
+
+### 2. Interactive mode as default for review loop
+- One tmux session per loop (not per task)
+- Sends next task to same session
+- User sees continuous flow
+
+### 3. Minimal LLM calls
+- Only for status reports (every 30-60s)
+- Only for analyzing findings
+- No LLM for permission detection (regex)
+
+### 4. Session persistence
+- On `stop()`: keeps session if visible mode
+- Logs: `tmux attach -t bender-copilot-interactive-XXXX`
+- User can continue manually
+
+## Configuration
+
+```env
+# Required
+GLM_API_KEY=csk-...
+
+# Optional: multiple keys for rotation
+GLM_API_KEYS=csk-key1,csk-key2,csk-key3
+
+# Optional: project path
+DROID_PROJECT_PATH=/path/to/project
+```

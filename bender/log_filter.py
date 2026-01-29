@@ -100,6 +100,18 @@ class LogFilter:
         r"^.*\.js:\d+$",
         r"^.*\.ts:\d+$",
         r"^.*\.py:\d+$",
+        # TUI мусор от droid/copilot
+        r".*\? for help.*",
+        r".*shift\+tab.*",
+        r".*ctrl\+[A-Za-z].*",
+        r".*Streaming\.\.\..*",
+        r".*Thinking\.\.\..*",
+        r".*Press ESC.*",
+        r".*Auto \(High\).*",
+        r".*cycle modes.*",
+        r".*TERMINAL.*",
+        r"^[╭╮╰╯│─]+$",         # Box drawing characters
+        r"^[█▓▒░⠋⠙⠹⠸⠼⠴⠦⠧⠇⠏]+$",  # Progress indicators
     ]
     
     # Паттерны завершения задачи
@@ -149,7 +161,12 @@ class LogFilter:
     
     def filter(self, raw_log: str) -> FilteredLog:
         """Отфильтровать лог"""
-        lines = raw_log.split('\n')
+        # Сначала удаляем ANSI escape-коды
+        import re as re_module
+        clean_log = re_module.sub(r'\x1b\[[0-9;]*[mKHJG]', '', raw_log)
+        clean_log = re_module.sub(r'[\x00-\x08\x0b\x0c\x0e-\x1f\x7f]', '', clean_log)
+        
+        lines = clean_log.split('\n')
         filtered_lines: List[str] = []
         
         for line in lines:
@@ -157,7 +174,7 @@ class LogFilter:
             if not line:
                 continue
             
-            # Пропустить вывод команд
+            # Пропустить вывод команд и TUI мусор
             if self._is_command_output(line):
                 continue
             

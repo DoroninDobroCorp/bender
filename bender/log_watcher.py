@@ -48,40 +48,50 @@ class LogWatcher:
     Периодически анализирует логи через GLM и определяет статус выполнения.
     """
     
-    ANALYSIS_PROMPT = """Ты анализируешь лог работы AI-ассистента над задачей.
-Твоя задача - определить текущий статус выполнения.
+    ANALYSIS_PROMPT = """Ты — опытный наблюдатель за работой AI-ассистента. Твоя роль как у тимлида, который следит за работой джуна с AI.
 
-ЗАДАЧА: {task}
+ЗАДАЧА которую выполняет ассистент:
+{task}
 
 {history}
 
-ЛОГ РАБОТЫ (последние сообщения, без вывода команд):
+ЛОГ РАБОТЫ (последние сообщения):
 ```
 {log}
 ```
 
 Время работы: {elapsed:.0f} секунд
 
-Определи статус и ответь в формате JSON:
+ПРОАНАЛИЗИРУЙ лог как умный человек:
+1. Что конкретно сейчас делает ассистент?
+2. Есть ли прогресс? (сравни с предыдущими проверками в history)
+3. Задача завершена? (ищи фразы типа "I've completed", "Готово", "Task completed", вывод findings)
+4. Ассистент застрял или зациклился? (повторяет одно и то же)
+5. Нужна помощь человека? (вопросы, ошибки доступа)
+
+Ответь в формате JSON:
 {{
     "status": "working|completed|stuck|loop|need_human|error",
-    "summary": "краткое описание что происходит (1-2 предложения)",
-    "suggestion": "что делать дальше (null если working)",
+    "summary": "Подробное описание что сейчас делает (2-3 предложения, 50-100 слов). Опиши: какой компонент создаёт, какие файлы редактирует, на каком этапе задачи находится.",
+    "suggestion": "что делать дальше (null если всё ок)",
     "should_restart": false,
     "context_for_restart": null
 }}
 
 Статусы:
-- working: модель активно работает над задачей
-- completed: задача выполнена успешно
-- stuck: модель зависла (нет прогресса >2 минут, повторяет одно и то же)
-- loop: модель зациклилась (делает одно и то же действие снова и снова)
-- need_human: модель просит помощи человека или нужно решение человека
-- error: произошла критическая ошибка
+- working: активно работает, есть прогресс
+- completed: задача ВЫПОЛНЕНА (ассистент явно сказал что закончил или вывел результат)
+- stuck: застряла (нет изменений, но задача не завершена)
+- loop: зациклилась (повторяет одни и те же действия)
+- need_human: ждёт ответа человека или нужно решение
+- error: критическая ошибка (403, 429, connection refused)
 
-Если should_restart=true, в context_for_restart напиши что было сделано для передачи в новую сессию.
+ВАЖНО: 
+- Если видишь "What would you like me to do next" или список findings — это COMPLETED
+- Если лог не меняется но есть финальный вывод — это COMPLETED, не STUCK
+- summary должен быть ПОДРОБНЫМ и понятным человеку, опиши конкретно что делает ассистент
 
-Ответь ТОЛЬКО JSON, без комментариев."""
+Ответь ТОЛЬКО JSON."""
 
     def __init__(self, glm_client: Union[GLMClient, LLMRouter], log_filter: Optional[LogFilter] = None):
         self.glm = glm_client
@@ -96,57 +106,33 @@ class LogWatcher:
         task: str,
         elapsed_seconds: float
     ) -> WatcherAnalysis:
-        """Проанализировать лог и определить статус"""
+        """Проанализировать лог и определить статус
         
-        # NEW: Обрезаем лог до последних N строк
+        Вся логика на LLM — она читает логи и решает:
+        - Что сейчас происходит (человеческим языком)
+        - Есть ли прогресс
+        - Завершена ли задача
+        - Нужно ли вмешательство человека
+        """
+        
+        # Обрезаем лог до последних N строк
         trimmed_log = self.context.tail_log(raw_log)
         
-        # Фильтруем лог
+        # Фильтруем шум
         filtered = self.filter.filter(trimmed_log)
         
-        # Быстрые проверки без GLM
-        if filtered.has_completion and not filtered.has_error:
-            return WatcherAnalysis(
-                result=AnalysisResult.COMPLETED,
-                summary="Задача выполнена успешно",
-                suggestion=None,
-            )
-        
-        if filtered.has_question:
-            return WatcherAnalysis(
-                result=AnalysisResult.NEED_HUMAN,
-                summary="Модель задаёт вопрос",
-                suggestion="Проверьте вопрос и ответьте",
-            )
-        
-        # Проверка на зависание (нет изменений в логе)
-        current_hash = hash(filtered.model_messages)
-        if current_hash == self._last_log_hash:
-            self._no_change_count += 1
-            if self._no_change_count >= 3:  # 3 проверки без изменений
-                return WatcherAnalysis(
-                    result=AnalysisResult.STUCK,
-                    summary="Нет прогресса в логах",
-                    suggestion="Перезапустить с контекстом",
-                    should_restart=True,
-                    context_for_restart=self._extract_context(filtered.model_messages),
-                )
-        else:
-            self._no_change_count = 0
-        self._last_log_hash = current_hash
-        
-        # Если лог слишком короткий, считаем что работа идёт
-        if filtered.filtered_length < 100:
+        # Если лог слишком короткий — ждём больше данных
+        if filtered.filtered_length < 50:
             return WatcherAnalysis(
                 result=AnalysisResult.WORKING,
                 summary="Модель начала работу",
                 suggestion=None,
             )
         
-        # Полный анализ через GLM
+        # Всё решает LLM — она читает логи и понимает что происходит
         analysis = await self._analyze_with_glm(filtered.model_messages, task, elapsed_seconds)
         
-        # NEW: Сохраняем в историю
+        # Сохраняем в историю
         self.context.add_checkpoint(analysis.result.value, analysis.summary)
         
         return analysis

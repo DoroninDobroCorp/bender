@@ -64,28 +64,35 @@ def setup_logging(
     level: Literal["DEBUG", "INFO", "WARNING", "ERROR"] = "INFO",
     log_dir: Optional[str] = None,
     json_format: bool = False,
-    log_file: Optional[str] = None
+    log_file: Optional[str] = None,
+    file_level: Optional[Literal["DEBUG", "INFO", "WARNING", "ERROR"]] = None,
+    quiet: bool = True  # По умолчанию тихий режим - меньше мусора
 ) -> logging.Logger:
     """Setup logging configuration
     
     Args:
-        level: Log level
+        level: Console log level
         log_dir: Directory for log files
         json_format: Use JSON format for file logs
         log_file: Specific log file name (auto-generated if None)
+        file_level: File log level (defaults to level if not specified)
+        quiet: Suppress noisy library logs (httpx, etc)
     
     Returns:
         Root logger
     """
     root_logger = logging.getLogger()
-    root_logger.setLevel(getattr(logging, level))
+    # Root level = minimum of console and file levels
+    file_lvl = file_level or level
+    min_level = min(getattr(logging, level), getattr(logging, file_lvl))
+    root_logger.setLevel(min_level)
     
     # Clear existing handlers
     root_logger.handlers.clear()
     
-    # Console handler with colors
+    # Console handler - только важные сообщения
     console_handler = logging.StreamHandler(sys.stdout)
-    console_handler.setLevel(getattr(logging, level))  # Use same level as root
+    console_handler.setLevel(getattr(logging, level))
     if sys.stdout.isatty():
         console_formatter = ColoredFormatter(
             "%(asctime)s [%(levelname)s] %(name)s: %(message)s",
@@ -98,6 +105,18 @@ def setup_logging(
         )
     console_handler.setFormatter(console_formatter)
     root_logger.addHandler(console_handler)
+    
+    # Suppress noisy library logs
+    if quiet:
+        # Эти библиотеки очень шумные на INFO уровне
+        logging.getLogger("httpx").setLevel(logging.WARNING)
+        logging.getLogger("httpcore").setLevel(logging.WARNING)
+        logging.getLogger("asyncio").setLevel(logging.WARNING)
+        logging.getLogger("urllib3").setLevel(logging.WARNING)
+        # Детали воркеров - только WARNING и выше в консоль
+        logging.getLogger("bender.workers.base").setLevel(logging.WARNING)
+        logging.getLogger("bender.worker_manager").setLevel(logging.WARNING)
+        logging.getLogger("bender.glm_client").setLevel(logging.WARNING)
     
     # File handler
     if log_dir:

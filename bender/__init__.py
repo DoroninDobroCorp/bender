@@ -3,7 +3,12 @@
 Bender supervises AI CLI tools (copilot, droid, codex) to complete tasks.
 It doesn't solve tasks itself, but ensures they are completed correctly.
 
-Uses GLM (Cerebras zai-glm-4.7) as the only LLM - a thinking model.
+Modes:
+- Standard: copilot -p "task" (non-interactive)
+- Interactive: copilot in tmux session (full terminal, can continue manually)
+- Review Loop: copilot → codex → copilot iterations
+
+Uses GLM (Cerebras zai-glm-4.7) as the supervisor LLM.
 Fallback: Qwen (qwen-3-235b-a22b-instruct-2507)
 """
 
@@ -18,6 +23,8 @@ from .workers import (
     WorkerResult,
     CopilotWorker,
     TokenUsage,
+    InteractiveCopilotWorker,
+    CopilotState,
     DroidWorker,
     CodexWorker,
 )
@@ -31,12 +38,7 @@ from .context_manager import ContextManager, ContextBudget
 # Task management
 from .task_clarifier import TaskClarifier, TaskComplexity, ClarifiedTask
 from .task_manager import TaskManager, TaskState, TaskResult
-
-# Legacy (for backwards compatibility)
-from .supervisor import BenderSupervisor, SupervisorDecision
-from .analyzer import ResponseAnalyzer, AnalysisAction
-from .watchdog import Watchdog, HealthCheck, HealthStatus, WatchdogAction
-from .enforcer import TaskEnforcer, EnforcementResult
+from .review_loop import ReviewLoopManager, ReviewLoopResult, LoopDecision
 
 __all__ = [
     # Core - GLM + Qwen fallback
@@ -49,6 +51,8 @@ __all__ = [
     "WorkerResult",
     "CopilotWorker",
     "TokenUsage",
+    "InteractiveCopilotWorker",
+    "CopilotState",
     "DroidWorker",
     "CodexWorker",
     "WorkerManager",
@@ -69,15 +73,7 @@ __all__ = [
     "TaskManager",
     "TaskState",
     "TaskResult",
-    # Legacy
-    "BenderSupervisor",
-    "SupervisorDecision",
-    "ResponseAnalyzer",
-    "AnalysisAction",
-    "Watchdog",
-    "HealthCheck",
-    "HealthStatus",
-    "WatchdogAction",
-    "TaskEnforcer",
-    "EnforcementResult",
+    "ReviewLoopManager",
+    "ReviewLoopResult",
+    "LoopDecision",
 ]
