@@ -14,7 +14,7 @@ from typing import Optional, Callable, Awaitable, Union
 from enum import Enum
 
 from .log_filter import LogFilter, FilteredLog
-from .glm_client import GLMClient
+from .glm_client import GLMClient, clean_surrogates
 from .llm_router import LLMRouter
 from .workers.base import WorkerStatus
 from .context_manager import ContextManager
@@ -144,6 +144,10 @@ class LogWatcher:
         elapsed: float
     ) -> WatcherAnalysis:
         """Глубокий анализ через GLM"""
+        
+        # Очищаем surrogate символы
+        log = clean_surrogates(log)
+        task = clean_surrogates(task)
         
         # NEW: Лог уже обрезан в analyze(), но добавим защиту
         if len(log) > self.context.MAX_LOG_CHARS:
