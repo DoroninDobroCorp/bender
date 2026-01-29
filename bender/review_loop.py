@@ -21,6 +21,7 @@ from .llm_router import LLMRouter
 from .task_clarifier import TaskClarifier, ClarifiedTask
 from .log_filter import LogFilter
 from .log_watcher import LogWatcher, AnalysisResult
+from .glm_client import clean_surrogates
 
 logger = logging.getLogger(__name__)
 

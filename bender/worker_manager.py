@@ -15,6 +15,7 @@ from .workers.copilot import CopilotWorker
 from .workers.interactive_copilot import InteractiveCopilotWorker
 from .workers.droid import DroidWorker
 from .workers.codex import CodexWorker
+from .glm_client import clean_surrogates
 
 logger = logging.getLogger(__name__)
 
@@ -239,7 +240,8 @@ class WorkerManager:
             return False, ""
         
         if hasattr(self._current_worker, 'wait_for_completion'):
-            return await self._current_worker.wait_for_completion(timeout)
+            success, output = await self._current_worker.wait_for_completion(timeout)
+            return success, clean_surrogates(output)
         
         # Для других workers - просто ждём
         return False, "Worker does not support wait_for_completion"
@@ -296,6 +298,7 @@ class WorkerManager:
                 
                 # Захватить вывод
                 output = await self._current_worker.capture_output()
+                output = clean_surrogates(output)
                 
                 # Получить только новый вывод
                 new_output = self._get_new_output(output)
@@ -348,7 +351,8 @@ class WorkerManager:
             Текущий вывод worker'а или пустая строка если worker не запущен
         """
         if self._current_worker:
-            return await self._current_worker.capture_output()
+            output = await self._current_worker.capture_output()
+            return clean_surrogates(output)
         return ""
     
     async def get_status(self) -> Dict:
