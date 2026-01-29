@@ -186,11 +186,11 @@ cd {shlex.quote(str(self.config.project_path))}
 script -q {shlex.quote(str(self._log_file))} {cmd_with_task}
 '''
         elif self.WORKER_NAME == "droid":
-            # droid exec ВСЕГДА использует unbuffered tee для чистого вывода
+            # droid exec использует script для захвата вывода
             cmd_with_task = f'{cli_cmd} "$(cat {shlex.quote(str(task_file))})"'
             script_content = f'''#!/bin/bash
 cd {shlex.quote(str(self.config.project_path))}
-stdbuf -oL {cmd_with_task} 2>&1 | tee {shlex.quote(str(self._log_file))}
+script -q {shlex.quote(str(self._log_file))} /bin/bash -c {shlex.quote(cmd_with_task)}
 '''
         else:
             # codex и другие: просто передаём как аргумент
