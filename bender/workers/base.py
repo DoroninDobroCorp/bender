@@ -220,51 +220,61 @@ class BaseWorker(ABC):
             raise
     
     async def _start_native_terminal(self, task: str) -> None:
-        """Запустить в нативном Terminal.app (visible режим)"""
+        """Запустить в нативном Terminal.app (visible режим)
+        
+        НАДЁЖНАЯ ДЕТЕКЦИЯ: пишем exit code в .done файл при завершении
+        """
         import tempfile
         from pathlib import Path
         
-        # Создаём лог-файл (session_id уже содержит "bender-")
+        # Создаём лог-файл и done-маркер
         self._log_file = Path(tempfile.gettempdir()) / f"{self.session_id}.log"
+        self._done_file = Path(tempfile.gettempdir()) / f"{self.session_id}.done"
+        
+        # Удаляем старый done-файл если есть
+        if self._done_file.exists():
+            self._done_file.unlink()
         
         # Пишем задачу в файл
         task_file = Path(tempfile.gettempdir()) / f"bender-task-{self.session_id}.txt"
         task_file.write_text(task)
         
-        # Создаём shell-скрипт - команда зависит от worker'а
+        # Создаём shell-скрипт с записью exit code в .done файл
         cli_cmd = shlex.join(self.cli_command)
         script_file = Path(tempfile.gettempdir()) / f"bender-run-{self.session_id}.sh"
+        done_file_path = shlex.quote(str(self._done_file))
+        log_file_path = shlex.quote(str(self._log_file))
         
-        # Для copilot используем -p, для droid зависит от режима
+        # Wrapper: запускаем через script для логов, но пишем exit code в .done
         if self.WORKER_NAME in ("copilot", "copilot-interactive"):
             # copilot -p "task"
             cmd_with_task = f'{cli_cmd} -p "$(cat {shlex.quote(str(task_file))})"'
-            # script для записи TTY вывода
             script_content = f'''#!/bin/bash
 cd {shlex.quote(str(self.config.project_path))}
-script -q {shlex.quote(str(self._log_file))} {cmd_with_task}
+script -q {log_file_path} /bin/bash -c '{cmd_with_task}; echo $? > {done_file_path}'
 '''
         elif self.WORKER_NAME == "droid":
             if self.config.visible:
-                # Visible: интерактивный droid с TUI - пользователь видит в реальном времени
+                # Visible: интерактивный droid с TUI
                 cmd_with_task = f'{cli_cmd} "$(cat {shlex.quote(str(task_file))})"'
                 script_content = f'''#!/bin/bash
 cd {shlex.quote(str(self.config.project_path))}
-script -q {shlex.quote(str(self._log_file))} /bin/bash -c {shlex.quote(cmd_with_task)}
+script -q {log_file_path} /bin/bash -c '{cmd_with_task}; echo $? > {done_file_path}'
 '''
             else:
                 # Background: droid exec для чистых логов
                 cmd_with_task = f'{cli_cmd} "$(cat {shlex.quote(str(task_file))})"'
                 script_content = f'''#!/bin/bash
 cd {shlex.quote(str(self.config.project_path))}
-{cmd_with_task} 2>&1 | tee {shlex.quote(str(self._log_file))}
+{cmd_with_task} 2>&1 | tee {log_file_path}
+echo $? > {done_file_path}
 '''
         else:
-            # codex и другие: просто передаём как аргумент
+            # codex и другие
             cmd_with_task = f'{cli_cmd} "$(cat {shlex.quote(str(task_file))})"'
             script_content = f'''#!/bin/bash
 cd {shlex.quote(str(self.config.project_path))}
-script -q {shlex.quote(str(self._log_file))} {cmd_with_task}
+script -q {log_file_path} /bin/bash -c '{cmd_with_task}; echo $? > {done_file_path}'
 '''
         script_file.write_text(script_content)
         script_file.chmod(0o755)
@@ -571,12 +581,24 @@ script -q {shlex.quote(str(self._log_file))} {cmd_with_task}
             logger.error(f"[{self.WORKER_NAME}] Error sending input: {e}")
     
     async def is_session_alive(self) -> bool:
-        """Проверить, жива ли сессия (tmux или native terminal)"""
+        """Проверить, жива ли сессия
+        
+        НАДЁЖНАЯ ДЕТЕКЦИЯ: проверяем .done файл
+        """
+        # 1. Самый надёжный способ: проверяем .done файл
+        done_file = getattr(self, '_done_file', None)
+        if done_file and done_file.exists():
+            try:
+                exit_code = int(done_file.read_text().strip())
+                logger.info(f"[{self.WORKER_NAME}] Done file found, exit code: {exit_code}")
+                return False  # Session completed
+            except (ValueError, IOError):
+                pass
+        
         if self.config.visible:
             # Visible mode: проверяем что процесс script ещё работает
             try:
                 import subprocess
-                # Ищем процесс по session_id (в имени скрипта)
                 result = subprocess.run(
                     ["pgrep", "-f", self.session_id],
                     capture_output=True,
