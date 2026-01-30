@@ -254,27 +254,22 @@ cd {shlex.quote(str(self.config.project_path))}
 script -q {log_file_path} /bin/bash -c '{cmd_with_task}; echo $? > {done_file_path}'
 '''
         elif self.WORKER_NAME == "droid":
-            if self.config.visible:
-                # Visible: интерактивный droid с TUI
-                cmd_with_task = f'{cli_cmd} "$(cat {shlex.quote(str(task_file))})"'
-                script_content = f'''#!/bin/bash
+            # droid exec работает одинаково для visible и background
+            task_file_escaped = shlex.quote(str(task_file))
+            script_content = f'''#!/bin/bash
 cd {shlex.quote(str(self.config.project_path))}
-script -q {log_file_path} /bin/bash -c '{cmd_with_task}; echo $? > {done_file_path}'
-'''
-            else:
-                # Background: droid exec для чистых логов
-                cmd_with_task = f'{cli_cmd} "$(cat {shlex.quote(str(task_file))})"'
-                script_content = f'''#!/bin/bash
-cd {shlex.quote(str(self.config.project_path))}
-{cmd_with_task} 2>&1 | tee {log_file_path}
+TASK=$(cat {task_file_escaped})
+{cli_cmd} "$TASK" 2>&1 | tee {log_file_path}
 echo $? > {done_file_path}
 '''
         else:
             # codex и другие
-            cmd_with_task = f'{cli_cmd} "$(cat {shlex.quote(str(task_file))})"'
+            task_file_escaped = shlex.quote(str(task_file))
             script_content = f'''#!/bin/bash
 cd {shlex.quote(str(self.config.project_path))}
-script -q {log_file_path} /bin/bash -c '{cmd_with_task}; echo $? > {done_file_path}'
+TASK=$(cat {task_file_escaped})
+{cli_cmd} "$TASK" 2>&1 | tee {log_file_path}
+echo $? > {done_file_path}
 '''
         script_file.write_text(script_content)
         script_file.chmod(0o755)
