@@ -108,11 +108,8 @@ class LogWatcher:
     ) -> WatcherAnalysis:
         """Проанализировать лог и определить статус
         
-        Вся логика на LLM — она читает логи и решает:
-        - Что сейчас происходит (человеческим языком)
-        - Есть ли прогресс
-        - Завершена ли задача
-        - Нужно ли вмешательство человека
+        Сначала пытаемся определить по паттернам (быстро, без LLM).
+        Если не получилось — используем LLM.
         """
         
         # Обрезаем лог до последних N строк
@@ -129,13 +126,93 @@ class LogWatcher:
                 suggestion=None,
             )
         
-        # Всё решает LLM — она читает логи и понимает что происходит
-        analysis = await self._analyze_with_glm(filtered.model_messages, task, elapsed_seconds)
+        # 1. Сначала пытаемся определить по паттернам (без LLM!)
+        pattern_result = self._analyze_by_patterns(filtered.model_messages)
+        if pattern_result:
+            self.context.add_checkpoint(pattern_result.result.value, pattern_result.summary)
+            return pattern_result
         
-        # Сохраняем в историю
-        self.context.add_checkpoint(analysis.result.value, analysis.summary)
+        # 2. Если паттерны не сработали — используем LLM
+        try:
+            analysis = await self._analyze_with_glm(filtered.model_messages, task, elapsed_seconds)
+            self.context.add_checkpoint(analysis.result.value, analysis.summary)
+            return analysis
+        except Exception as e:
+            # LLM недоступен — возвращаем "working"
+            logger.warning(f"LLM unavailable for analysis: {e}")
+            return WatcherAnalysis(
+                result=AnalysisResult.WORKING,
+                summary="LLM недоступен, работа продолжается",
+                suggestion=None,
+            )
+    
+    def _analyze_by_patterns(self, log: str) -> Optional[WatcherAnalysis]:
+        """Анализ по паттернам без LLM
         
-        return analysis
+        Returns:
+            WatcherAnalysis если удалось определить статус, None если нужен LLM
+        """
+        last_chunk = log[-2000:] if len(log) > 2000 else log
+        
+        # Паттерны завершения
+        completion_patterns = [
+            ("Task completed", "Задача завершена"),
+            ("All done", "Всё готово"),
+            ("Successfully", "Успешно завершено"),
+            ("I've completed", "Ассистент завершил работу"),
+            ("Готово", "Готово"),
+            ("Проблем не найдено", "Проверка завершена, проблем нет"),
+            ("CRITICAL:", "Найдены критические проблемы"),
+            ("HIGH:", "Найдены проблемы"),
+            ("Findings:", "Анализ завершён"),
+            ("Total usage est:", "Copilot завершил работу"),
+            ("API time spent:", "Сессия завершена"),
+        ]
+        
+        for pattern, summary in completion_patterns:
+            if pattern in last_chunk:
+                logger.info(f"[LogWatcher] Pattern match: '{pattern}'")
+                return WatcherAnalysis(
+                    result=AnalysisResult.COMPLETED,
+                    summary=summary,
+                    suggestion=None,
+                )
+        
+        # Паттерны ошибок
+        error_patterns = [
+            ("Error:", "Ошибка в работе"),
+            ("FAILED", "Сбой"),
+            ("Permission denied", "Нет доступа"),
+            ("rate limit", "Rate limit API"),
+        ]
+        
+        for pattern, summary in error_patterns:
+            if pattern.lower() in last_chunk.lower():
+                return WatcherAnalysis(
+                    result=AnalysisResult.ERROR,
+                    summary=summary,
+                    suggestion="Проверьте логи",
+                )
+        
+        # Паттерны вопросов (нужен человек)
+        question_patterns = [
+            ("?", "Ассистент задаёт вопрос"),
+            ("Do you want", "Требуется подтверждение"),
+            ("Should I", "Требуется решение"),
+        ]
+        
+        # Проверяем только последние 500 символов для вопросов
+        last_bit = last_chunk[-500:]
+        for pattern, summary in question_patterns:
+            if pattern in last_bit and last_bit.count(pattern) <= 2:
+                return WatcherAnalysis(
+                    result=AnalysisResult.NEED_HUMAN,
+                    summary=summary,
+                    suggestion="Ответьте на вопрос ассистента",
+                )
+        
+        # Не удалось определить по паттернам
+        return None
     
     async def _analyze_with_glm(
         self,

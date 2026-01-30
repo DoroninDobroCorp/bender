@@ -255,16 +255,18 @@ class LLMRouter:
         # Пробуем каждый ключ
         for attempt in range(len(self.all_keys)):
             api_key = await self.key_rotator.get_key()
+            logger.debug(f"Using key ...{api_key[-8:]} (attempt {attempt + 1}/{len(self.all_keys)})")
             
             # Пауза перед повторной попыткой (после первой неудачи)
             if attempt > 0:
                 wait_time = 10 + attempt * 5  # 10, 15, 20 секунд
-                logger.info(f"🔄 Retry {attempt + 1}/{len(self.all_keys)} with different key, waiting {wait_time}s")
+                logger.info(f"🔄 Retry {attempt + 1}/{len(self.all_keys)} with key ...{api_key[-8:]}, waiting {wait_time}s")
                 await asyncio.sleep(wait_time)
             
             try:
                 response = await self._try_with_key(api_key, "glm", prompt, temperature, json_mode, max_tokens)
                 if response:
+                    logger.debug(f"✅ Key ...{api_key[-8:]} succeeded")
                     return response
             except RuntimeError as e:
                 if "wait required" in str(e):
