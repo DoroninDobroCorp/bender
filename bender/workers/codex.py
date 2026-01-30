@@ -58,11 +58,28 @@ class CodexWorker(BaseWorker):
             formatted += f"\n\nКонтекст:\n{context}"
         return formatted
     
+    # Паттерны завершения работы Codex (проверяем в логе)
+    COMPLETION_PATTERNS = [
+        "Проблем не найдено",
+        "No issues found",
+        "Task completed",
+        "All done",
+        "CRITICAL:",  # Нашёл проблемы и вывел
+        "HIGH:",
+        "Findings:",
+        "Summary:",
+        "vladimirdoronin@",  # Вернулся в shell prompt
+        "$ exit",
+        "logout",
+    ]
+    
     async def wait_for_completion(self, timeout: float = 1800) -> tuple:
         """Дождаться завершения — LLM решает когда готово"""
         
         start = asyncio.get_event_loop().time()
         check_interval = 30  # LLM проверка каждые 30 секунд
+        last_output_len = 0
+        no_change_count = 0
         
         while asyncio.get_event_loop().time() - start < timeout:
             await asyncio.sleep(check_interval)
@@ -75,6 +92,29 @@ class CodexWorker(BaseWorker):
                     current_output = ""
             else:
                 current_output = await self.capture_output()
+            
+            # Детекция завершения по паттернам в логе
+            last_chunk = current_output[-3000:] if len(current_output) > 3000 else current_output
+            for pattern in self.COMPLETION_PATTERNS:
+                if pattern in last_chunk:
+                    self._completed = True
+                    self._output = current_output
+                    self.status = WorkerStatus.COMPLETED
+                    logger.info(f"[{self.WORKER_NAME}] Completion pattern found: '{pattern}'")
+                    return True, self._output
+            
+            # Детекция зависания: если лог не меняется 3 раза подряд (90 секунд)
+            if len(current_output) == last_output_len:
+                no_change_count += 1
+                if no_change_count >= 3:
+                    logger.warning(f"[{self.WORKER_NAME}] Log unchanged for {no_change_count * check_interval}s, assuming stuck")
+                    self._completed = True
+                    self._output = current_output
+                    self.status = WorkerStatus.STUCK
+                    return False, self._output
+            else:
+                no_change_count = 0
+                last_output_len = len(current_output)
             
             # Проверяем жива ли сессия
             session_alive = await self.is_session_alive()
