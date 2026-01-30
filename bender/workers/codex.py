@@ -9,11 +9,15 @@ Codex Worker - worker для Codex CLI (сложные задачи)
 
 import asyncio
 import logging
+import re
 from typing import List, Optional, Callable, Awaitable
 
 from .base import BaseWorker, WorkerConfig, WorkerStatus
 
 logger = logging.getLogger(__name__)
+
+# ANSI escape codes regex
+ANSI_ESCAPE = re.compile(r'\x1b\[[0-9;]*[a-zA-Z]|\x1b\][^\x07]*\x07')
 
 
 class CodexWorker(BaseWorker):
@@ -115,10 +119,11 @@ class CodexWorker(BaseWorker):
                 logger.info(f"[{self.WORKER_NAME}] Process exited - task completed")
                 return True, self._output
             
-            # 2. Детекция по паттернам
-            last_chunk = current_output[-3000:] if len(current_output) > 3000 else current_output
+            # 2. Детекция по паттернам (очищаем ANSI коды!)
+            last_chunk = current_output[-5000:] if len(current_output) > 5000 else current_output
+            clean_chunk = ANSI_ESCAPE.sub('', last_chunk)
             for pattern in self.COMPLETION_PATTERNS:
-                if pattern in last_chunk:
+                if pattern in clean_chunk:
                     self._completed = True
                     self._output = current_output
                     self.status = WorkerStatus.COMPLETED
