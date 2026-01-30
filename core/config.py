@@ -22,13 +22,18 @@ class Config(BaseSettings):
         extra='ignore'
     )
     
-    # GLM (Cerebras) - нужен только для droid worker
+    # GLM (Cerebras) - primary LLM
     glm_api_key: Optional[str] = None
     glm_api_keys: Optional[str] = None  # Comma-separated list for rotation
     droid_project_path: Optional[str] = None
     
     # Алиас для glm_api_key
     cerebras_api_key: Optional[str] = None
+    
+    # Gemini (Google) - fallback LLM
+    # ВАЖНО: Разрешены ТОЛЬКО gemini-2.0-flash-exp и gemini-2.5-pro-preview-06-05!
+    gemini_api_key: Optional[str] = None
+    gemini_api_keys: Optional[str] = None  # Comma-separated list for rotation
     
     # Опционально - Droid
     droid_binary: str = "droid"
@@ -50,7 +55,7 @@ class Config(BaseSettings):
     idle_timeout: int = 120
     check_interval: float = 2.0
     
-    # Опционально - LLM settings (только GLM)
+    # Опционально - LLM settings
     llm_max_retries: int = 3
     llm_retry_delay: float = 1.0
     llm_requests_per_minute: int = 60
@@ -131,13 +136,24 @@ class Config(BaseSettings):
     
     @property
     def api_keys_list(self) -> List[str]:
-        """Get list of API keys for rotation"""
+        """Get list of Cerebras API keys for rotation"""
         if self.glm_api_keys:
             keys = [k.strip() for k in self.glm_api_keys.split(',') if k.strip()]
             if keys:
                 return keys
         if self.glm_api_key:
             return [self.glm_api_key]
+        return []
+    
+    @property
+    def gemini_keys_list(self) -> List[str]:
+        """Get list of Gemini API keys for rotation"""
+        if self.gemini_api_keys:
+            keys = [k.strip() for k in self.gemini_api_keys.split(',') if k.strip()]
+            if keys:
+                return keys
+        if self.gemini_api_key:
+            return [self.gemini_api_key]
         return []
     
     def get_validation_errors(self) -> List[str]:

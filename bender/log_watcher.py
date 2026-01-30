@@ -1,14 +1,16 @@
 """
 Log Watcher - мониторинг и анализ логов CLI workers
 
-Оптимизации контекста:
+Оптимизации:
+- Паттерны проверяются ВСЕГДА (без LLM)
+- LLM вызывается ТОЛЬКО при зависании (300s) или детекции завершения
 - Tail логов (последние N строк)
-- Скользящее окно истории
-- Компрессия при переполнении
 """
 
 import asyncio
+import hashlib
 import logging
+import time
 from dataclasses import dataclass
 from typing import Optional, Callable, Awaitable, Union
 from enum import Enum
@@ -36,69 +38,68 @@ class AnalysisResult(str, Enum):
 class WatcherAnalysis:
     """Результат анализа от watcher'а"""
     result: AnalysisResult
-    summary: str                    # Краткое описание происходящего
-    suggestion: Optional[str]       # Предложение что делать
-    should_restart: bool = False    # Нужен ли перезапуск
-    context_for_restart: Optional[str] = None  # Контекст для перезапуска
+    summary: str
+    suggestion: Optional[str]
+    should_restart: bool = False
+    context_for_restart: Optional[str] = None
 
 
 class LogWatcher:
     """Наблюдатель за логами CLI workers
     
-    Периодически анализирует логи через GLM и определяет статус выполнения.
+    Логика вызова LLM (экономия токенов):
+    - Паттерны проверяются ВСЕГДА (бесплатно)
+    - LLM вызывается ТОЛЬКО если:
+      1. Лог не меняется 300 секунд (10 проверок по 30 сек)
+      2. Паттерн детектировал завершение (для подтверждения)
     """
     
-    ANALYSIS_PROMPT = """Ты — опытный наблюдатель за работой AI-ассистента. Твоя роль как у тимлида, который следит за работой джуна с AI.
+    # Таймаут "зависания" в секундах
+    STUCK_TIMEOUT_SECONDS = 300  # 5 минут без изменений
+    CHECK_INTERVAL = 30  # Интервал проверок
+    
+    ANALYSIS_PROMPT = """Ты наблюдатель за AI-ассистентом. Определи статус работы.
 
-ЗАДАЧА которую выполняет ассистент:
+ЗАДАЧА:
 {task}
 
-{history}
-
-ЛОГ РАБОТЫ (последние сообщения):
+ЛОГ (последние сообщения):
 ```
 {log}
 ```
 
-Время работы: {elapsed:.0f} секунд
+Время работы: {elapsed:.0f} сек
 
-ПРОАНАЛИЗИРУЙ лог как умный человек:
-1. Что конкретно сейчас делает ассистент?
-2. Есть ли прогресс? (сравни с предыдущими проверками в history)
-3. Задача завершена? (ищи фразы типа "I've completed", "Готово", "Task completed", вывод findings)
-4. Ассистент застрял или зациклился? (повторяет одно и то же)
-5. Нужна помощь человека? (вопросы, ошибки доступа)
-
-Ответь в формате JSON:
+Ответь JSON:
 {{
     "status": "working|completed|stuck|loop|need_human|error",
-    "summary": "Подробное описание что сейчас делает (2-3 предложения, 50-100 слов). Опиши: какой компонент создаёт, какие файлы редактирует, на каком этапе задачи находится.",
-    "suggestion": "что делать дальше (null если всё ок)",
-    "should_restart": false,
-    "context_for_restart": null
+    "summary": "Что делает (1-2 предложения)",
+    "suggestion": "что делать (null если ок)"
 }}
 
 Статусы:
-- working: активно работает, есть прогресс
-- completed: задача ВЫПОЛНЕНА (ассистент явно сказал что закончил или вывел результат)
-- stuck: застряла (нет изменений, но задача не завершена)
-- loop: зациклилась (повторяет одни и те же действия)
-- need_human: ждёт ответа человека или нужно решение
-- error: критическая ошибка (403, 429, connection refused)
+- working: активно работает
+- completed: задача ВЫПОЛНЕНА
+- stuck: застряла
+- loop: зациклилась
+- need_human: ждёт человека
+- error: ошибка
 
-ВАЖНО: 
-- Если видишь "What would you like me to do next" или список findings — это COMPLETED
-- Если лог не меняется но есть финальный вывод — это COMPLETED, не STUCK
-- summary должен быть ПОДРОБНЫМ и понятным человеку, опиши конкретно что делает ассистент
-
-Ответь ТОЛЬКО JSON."""
+Только JSON."""
 
     def __init__(self, glm_client: Union[GLMClient, LLMRouter], log_filter: Optional[LogFilter] = None):
         self.glm = glm_client
         self.filter = log_filter or LogFilter()
-        self.context = ContextManager()  # NEW: управление контекстом
+        self.context = ContextManager()
+        
+        # Для детекции зависания
         self._last_log_hash: Optional[str] = None
+        self._last_log_time: float = time.time()
         self._no_change_count: int = 0
+    
+    def _compute_hash(self, log: str) -> str:
+        """Быстрый хеш лога"""
+        return hashlib.md5(log.encode()[:5000]).hexdigest()
     
     async def analyze(
         self,
@@ -106,19 +107,21 @@ class LogWatcher:
         task: str,
         elapsed_seconds: float
     ) -> WatcherAnalysis:
-        """Проанализировать лог и определить статус
+        """Анализ лога
         
-        Сначала пытаемся определить по паттернам (быстро, без LLM).
-        Если не получилось — используем LLM.
+        LLM вызывается ТОЛЬКО при:
+        1. Зависании (300s без изменений)
+        2. Паттерн показал completion (для подтверждения)
         """
         
-        # Обрезаем лог до последних N строк
+        # Обрезаем лог
         trimmed_log = self.context.tail_log(raw_log)
         
         # Фильтруем шум
         filtered = self.filter.filter(trimmed_log)
+        log_content = filtered.model_messages
         
-        # Если лог слишком короткий — ждём больше данных
+        # Слишком короткий - ждём
         if filtered.filtered_length < 50:
             return WatcherAnalysis(
                 result=AnalysisResult.WORKING,
@@ -126,52 +129,88 @@ class LogWatcher:
                 suggestion=None,
             )
         
-        # 1. Сначала пытаемся определить по паттернам (без LLM!)
-        pattern_result = self._analyze_by_patterns(filtered.model_messages)
-        if pattern_result:
-            self.context.add_checkpoint(pattern_result.result.value, pattern_result.summary)
-            return pattern_result
+        # Проверяем изменился ли лог
+        current_hash = self._compute_hash(log_content)
+        log_changed = current_hash != self._last_log_hash
         
-        # 2. Если паттерны не сработали — используем LLM
-        try:
-            analysis = await self._analyze_with_glm(filtered.model_messages, task, elapsed_seconds)
-            self.context.add_checkpoint(analysis.result.value, analysis.summary)
-            return analysis
-        except Exception as e:
-            # LLM недоступен — возвращаем "working"
-            logger.warning(f"LLM unavailable for analysis: {e}")
-            return WatcherAnalysis(
-                result=AnalysisResult.WORKING,
-                summary="LLM недоступен, работа продолжается",
-                suggestion=None,
-            )
+        if log_changed:
+            self._last_log_hash = current_hash
+            self._last_log_time = time.time()
+            self._no_change_count = 0
+        else:
+            self._no_change_count += 1
+        
+        # 1. ВСЕГДА проверяем паттерны (бесплатно)
+        pattern_result = self._analyze_by_patterns(log_content)
+        
+        if pattern_result:
+            # Паттерн сработал!
+            if pattern_result.result == AnalysisResult.COMPLETED:
+                logger.info(f"[LogWatcher] Completion pattern detected: {pattern_result.summary}")
+                # Для завершения - можем вызвать LLM для подтверждения, но не обязательно
+                self.context.add_checkpoint(pattern_result.result.value, pattern_result.summary)
+                return pattern_result
+            elif pattern_result.result == AnalysisResult.ERROR:
+                logger.warning(f"[LogWatcher] Error pattern: {pattern_result.summary}")
+                return pattern_result
+            elif pattern_result.result == AnalysisResult.NEED_HUMAN:
+                return pattern_result
+        
+        # 2. Проверяем зависание (300 секунд без изменений)
+        stuck_seconds = time.time() - self._last_log_time
+        is_stuck = stuck_seconds >= self.STUCK_TIMEOUT_SECONDS
+        
+        if is_stuck:
+            logger.warning(f"[LogWatcher] No log changes for {stuck_seconds:.0f}s - calling LLM")
+            # Вызываем LLM чтобы понять что случилось
+            try:
+                analysis = await self._analyze_with_glm(log_content, task, elapsed_seconds)
+                self.context.add_checkpoint(analysis.result.value, analysis.summary)
+                return analysis
+            except Exception as e:
+                logger.warning(f"LLM unavailable: {e}")
+                # LLM недоступен - считаем что застряло
+                return WatcherAnalysis(
+                    result=AnalysisResult.STUCK,
+                    summary=f"Нет изменений {stuck_seconds:.0f}s, LLM недоступен",
+                    suggestion="Проверьте вручную",
+                )
+        
+        # 3. Лог меняется - просто работает
+        return WatcherAnalysis(
+            result=AnalysisResult.WORKING,
+            summary="Ассистент работает",
+            suggestion=None,
+        )
     
     def _analyze_by_patterns(self, log: str) -> Optional[WatcherAnalysis]:
-        """Анализ по паттернам без LLM
-        
-        Returns:
-            WatcherAnalysis если удалось определить статус, None если нужен LLM
-        """
+        """Анализ по паттернам (без LLM!)"""
         last_chunk = log[-2000:] if len(log) > 2000 else log
         
-        # Паттерны завершения
+        # Паттерны завершения (Copilot, Codex, Droid)
         completion_patterns = [
-            ("Task completed", "Задача завершена"),
-            ("All done", "Всё готово"),
-            ("Successfully", "Успешно завершено"),
-            ("I've completed", "Ассистент завершил работу"),
-            ("Готово", "Готово"),
-            ("Проблем не найдено", "Проверка завершена, проблем нет"),
-            ("CRITICAL:", "Найдены критические проблемы"),
-            ("HIGH:", "Найдены проблемы"),
-            ("Findings:", "Анализ завершён"),
+            # Copilot
             ("Total usage est:", "Copilot завершил работу"),
             ("API time spent:", "Сессия завершена"),
+            ("Premium request", "Copilot завершил"),
+            # Codex
+            ("CRITICAL:", "Найдены критические проблемы"),
+            ("HIGH:", "Найдены проблемы"),
+            ("Проблем не найдено", "Проверка завершена"),
+            ("vladimirdoronin@", "Вернулся к shell prompt"),
+            # Droid
+            ("Changes saved", "Droid сохранил изменения"),
+            ("File updated", "Файл обновлён"),
+            # Общие
+            ("Task completed", "Задача завершена"),
+            ("Successfully", "Успешно"),
+            ("I've completed", "Завершено"),
+            ("Готово", "Готово"),
         ]
         
         for pattern, summary in completion_patterns:
             if pattern in last_chunk:
-                logger.info(f"[LogWatcher] Pattern match: '{pattern}'")
+                logger.debug(f"[LogWatcher] Pattern match: '{pattern}'")
                 return WatcherAnalysis(
                     result=AnalysisResult.COMPLETED,
                     summary=summary,
@@ -180,10 +219,10 @@ class LogWatcher:
         
         # Паттерны ошибок
         error_patterns = [
-            ("Error:", "Ошибка в работе"),
-            ("FAILED", "Сбой"),
             ("Permission denied", "Нет доступа"),
-            ("rate limit", "Rate limit API"),
+            ("rate limit", "Rate limit"),
+            ("429", "API перегружен"),
+            ("connection refused", "Нет соединения"),
         ]
         
         for pattern, summary in error_patterns:
@@ -194,24 +233,15 @@ class LogWatcher:
                     suggestion="Проверьте логи",
                 )
         
-        # Паттерны вопросов (нужен человек)
-        question_patterns = [
-            ("?", "Ассистент задаёт вопрос"),
-            ("Do you want", "Требуется подтверждение"),
-            ("Should I", "Требуется решение"),
-        ]
+        # Паттерны вопросов
+        last_bit = last_chunk[-300:]
+        if "?" in last_bit or "Do you want" in last_bit:
+            return WatcherAnalysis(
+                result=AnalysisResult.NEED_HUMAN,
+                summary="Ассистент задаёт вопрос",
+                suggestion="Ответьте",
+            )
         
-        # Проверяем только последние 500 символов для вопросов
-        last_bit = last_chunk[-500:]
-        for pattern, summary in question_patterns:
-            if pattern in last_bit and last_bit.count(pattern) <= 2:
-                return WatcherAnalysis(
-                    result=AnalysisResult.NEED_HUMAN,
-                    summary=summary,
-                    suggestion="Ответьте на вопрос ассистента",
-                )
-        
-        # Не удалось определить по паттернам
         return None
     
     async def _analyze_with_glm(
@@ -220,28 +250,19 @@ class LogWatcher:
         task: str,
         elapsed: float
     ) -> WatcherAnalysis:
-        """Глубокий анализ через GLM"""
+        """Глубокий анализ через LLM (вызывается редко!)"""
         
-        # Очищаем surrogate символы
         log = clean_surrogates(log)
         task = clean_surrogates(task)
         
-        # NEW: Лог уже обрезан в analyze(), но добавим защиту
-        if len(log) > self.context.MAX_LOG_CHARS:
-            log = log[-self.context.MAX_LOG_CHARS:]
+        # Ограничиваем размер
+        if len(log) > 3000:
+            log = log[-3000:]
         
-        # NEW: Добавляем историю проверок для контекста
-        history_context = self.context.get_history_context()
-        
-        prompt = self.ANALYSIS_PROMPT.format(
-            task=task,
-            log=log,
-            elapsed=elapsed,
-            history=history_context,
-        )
+        prompt = self.ANALYSIS_PROMPT.format(task=task, log=log, elapsed=elapsed)
         
         try:
-            response = await self.glm.generate_json(prompt, temperature=0.1)
+            response = await self.glm.generate_json(prompt, temperature=0.1, max_tokens=200)
             
             status_map = {
                 "working": AnalysisResult.WORKING,
@@ -256,42 +277,24 @@ class LogWatcher:
             
             return WatcherAnalysis(
                 result=result,
-                summary=response.get("summary", "Анализ недоступен"),
+                summary=response.get("summary", "Анализ"),
                 suggestion=response.get("suggestion"),
-                should_restart=response.get("should_restart", False),
-                context_for_restart=response.get("context_for_restart"),
             )
             
         except Exception as e:
             logger.warning(f"GLM analysis failed: {e}")
             return WatcherAnalysis(
                 result=AnalysisResult.WORKING,
-                summary="Не удалось проанализировать (GLM error)",
+                summary=f"LLM error: {e}",
                 suggestion=None,
             )
     
-    def _extract_context(self, log: str, max_length: int = 500) -> str:
-        """Извлечь контекст для перезапуска"""
-        lines = log.strip().split('\n')
-        
-        # Берём последние строки
-        context_lines = []
-        current_length = 0
-        
-        for line in reversed(lines):
-            if current_length + len(line) > max_length:
-                break
-            context_lines.insert(0, line)
-            current_length += len(line) + 1
-        
-        return '\n'.join(context_lines)
-    
     def reset(self):
-        """Сбросить состояние watcher'а"""
+        """Сброс состояния"""
         self._last_log_hash = None
+        self._last_log_time = time.time()
         self._no_change_count = 0
-        self.context.reset()  # NEW: сброс контекста
+        self.context.reset()
     
     def get_context_stats(self) -> dict:
-        """Получить статистику контекста"""
         return self.context.get_stats()

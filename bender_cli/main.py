@@ -231,9 +231,11 @@ def run(ctx, task, droid, opus, codex, auto, interval, simple, visible, interact
     # Visible mode показывает INFO
     log_level = "DEBUG" if ctx.obj.get('debug', False) else ("INFO" if visible else "WARNING")
     
-    # Определяем директорию для логов
+    # Логи хранятся в папке bender (внутри пакета bender)
     from pathlib import Path
-    log_dir = Path.cwd() / "logs"
+    import bender
+    bender_pkg_dir = Path(bender.__file__).parent
+    log_dir = bender_pkg_dir / "logs"
     log_dir.mkdir(exist_ok=True)
     
     from datetime import datetime
@@ -353,7 +355,8 @@ async def _run_review_loop(task: str, max_iterations: int, visible: bool, projec
     
     # Use multiple API keys if available
     api_keys = config.api_keys_list if config.api_keys_list else None
-    llm = LLMRouter(config.glm_api_key, requests_per_minute=30, api_keys=api_keys)
+    gemini_keys = config.gemini_keys_list if config.gemini_keys_list else None
+    llm = LLMRouter(config.glm_api_key, requests_per_minute=30, api_keys=api_keys, gemini_api_keys=gemini_keys)
     
     manager_config = ManagerConfig(
         project_path=proj_path,
@@ -454,7 +457,8 @@ async def _run_interactive_simple(task: str, visible: bool, project_path: Option
     
     # Create LLM for task clarification
     api_keys = config.api_keys_list if config.api_keys_list else None
-    llm = LLMRouter(config.glm_api_key, requests_per_minute=30, api_keys=api_keys)
+    gemini_keys = config.gemini_keys_list if config.gemini_keys_list else None
+    llm = LLMRouter(config.glm_api_key, requests_per_minute=30, api_keys=api_keys, gemini_api_keys=gemini_keys)
     
     async def on_status(message: str):
         bender_echo(message)
@@ -549,7 +553,9 @@ async def _run_task(task: str, worker_type: Optional[str], interval: int, simple
     from bender.worker_manager import WorkerType, ManagerConfig
     
     # Create LLM router with rate limiting (30 req/min for Cerebras free tier)
-    llm = LLMRouter(config.glm_api_key, requests_per_minute=30)
+    api_keys = config.api_keys_list if config.api_keys_list else None
+    gemini_keys = config.gemini_keys_list if config.gemini_keys_list else None
+    llm = LLMRouter(config.glm_api_key, requests_per_minute=30, api_keys=api_keys, gemini_api_keys=gemini_keys)
     
     # Worker type mapping (None = auto-select)
     wt = None
