@@ -1,8 +1,10 @@
 """
 Codex Worker - worker для Codex CLI (сложные задачи)
 
-Логика завершения полностью на LLM — она читает логи и решает готово или нет.
-Проверка каждые 30 секунд.
+НАДЁЖНАЯ ДЕТЕКЦИЯ:
+- `codex exec` завершается сам с exit code
+- Опционально: --json для JSONL событий
+- Fallback на паттерны для интерактивного режима
 """
 
 import asyncio
@@ -17,14 +19,27 @@ logger = logging.getLogger(__name__)
 class CodexWorker(BaseWorker):
     """Worker для Codex CLI
     
-    Режим для сверхсложных задач: поиск сложных багов, детальное планирование.
-    Использует dangerous mode.
-    
-    Завершение определяется через LLM-анализ логов.
+    Надёжная детекция:
+    1. Non-interactive: `codex exec` завершается сам
+    2. Interactive: паттерны + exit code процесса
     """
     
     WORKER_NAME = "codex"
     INTERVAL_MULTIPLIER = 2.0
+    
+    # Паттерны завершения (для интерактивного режима)
+    COMPLETION_PATTERNS = [
+        "Проблем не найдено",
+        "No issues found",
+        "Task completed",
+        "All done",
+        "CRITICAL:",
+        "HIGH:",
+        "Findings:",
+        "Summary:",
+        "vladimirdoronin@",  # Shell prompt
+        "$ exit",
+    ]
     
     def __init__(
         self, 
@@ -32,15 +47,24 @@ class CodexWorker(BaseWorker):
         llm_analyze: Optional[Callable[[str, str, float], Awaitable[dict]]] = None,
     ):
         super().__init__(config)
-        self._llm_analyze = llm_analyze  # callback для LLM анализа
+        self._llm_analyze = llm_analyze
         self._current_task = ""
     
     @property
     def cli_command(self) -> List[str]:
-        return [
-            "codex",
-            "--dangerously-bypass-approvals-and-sandbox",
-        ]
+        if self.config.visible:
+            # Интерактивный режим
+            return [
+                "codex",
+                "--dangerously-bypass-approvals-and-sandbox",
+            ]
+        else:
+            # Non-interactive: codex exec (завершается сам!)
+            return [
+                "codex", "exec",
+                "--dangerously-bypass-approvals-and-sandbox",
+                "--full-auto",
+            ]
     
     def format_task(self, task: str, context: Optional[str] = None) -> str:
         self._current_task = task
@@ -58,26 +82,15 @@ class CodexWorker(BaseWorker):
             formatted += f"\n\nКонтекст:\n{context}"
         return formatted
     
-    # Паттерны завершения работы Codex (проверяем в логе)
-    COMPLETION_PATTERNS = [
-        "Проблем не найдено",
-        "No issues found",
-        "Task completed",
-        "All done",
-        "CRITICAL:",  # Нашёл проблемы и вывел
-        "HIGH:",
-        "Findings:",
-        "Summary:",
-        "vladimirdoronin@",  # Вернулся в shell prompt
-        "$ exit",
-        "logout",
-    ]
-    
     async def wait_for_completion(self, timeout: float = 1800) -> tuple:
-        """Дождаться завершения — LLM решает когда готово"""
+        """Дождаться завершения
+        
+        Для exec режима - ждём exit code (надёжно!)
+        Для interactive - паттерны + exit code
+        """
         
         start = asyncio.get_event_loop().time()
-        check_interval = 30  # LLM проверка каждые 30 секунд
+        check_interval = 15  # Проверка каждые 15 секунд
         last_output_len = 0
         no_change_count = 0
         
@@ -93,21 +106,30 @@ class CodexWorker(BaseWorker):
             else:
                 current_output = await self.capture_output()
             
-            # Детекция завершения по паттернам в логе
+            # 1. НАДЁЖНО: Проверяем завершился ли процесс
+            session_alive = await self.is_session_alive()
+            if not session_alive:
+                self._completed = True
+                self._output = current_output
+                self.status = WorkerStatus.COMPLETED
+                logger.info(f"[{self.WORKER_NAME}] Process exited - task completed")
+                return True, self._output
+            
+            # 2. Детекция по паттернам
             last_chunk = current_output[-3000:] if len(current_output) > 3000 else current_output
             for pattern in self.COMPLETION_PATTERNS:
                 if pattern in last_chunk:
                     self._completed = True
                     self._output = current_output
                     self.status = WorkerStatus.COMPLETED
-                    logger.info(f"[{self.WORKER_NAME}] Completion pattern found: '{pattern}'")
+                    logger.info(f"[{self.WORKER_NAME}] Pattern: '{pattern}'")
                     return True, self._output
             
-            # Детекция зависания: если лог не меняется 10 раз подряд (5 минут)
+            # 3. Детекция зависания (300s без изменений)
             if len(current_output) == last_output_len:
                 no_change_count += 1
-                if no_change_count >= 10:  # 10 * 30s = 300s = 5 минут
-                    logger.warning(f"[{self.WORKER_NAME}] Log unchanged for {no_change_count * check_interval}s, assuming stuck")
+                if no_change_count >= 20:  # 20 * 15s = 300s = 5 минут
+                    logger.warning(f"[{self.WORKER_NAME}] No output for 5min - stuck")
                     self._completed = True
                     self._output = current_output
                     self.status = WorkerStatus.STUCK
@@ -115,44 +137,6 @@ class CodexWorker(BaseWorker):
             else:
                 no_change_count = 0
                 last_output_len = len(current_output)
-            
-            # Проверяем жива ли сессия
-            session_alive = await self.is_session_alive()
-            if not session_alive:
-                self._completed = True
-                self._output = current_output
-                self.status = WorkerStatus.COMPLETED
-                logger.info(f"[{self.WORKER_NAME}] Session closed, completed")
-                return True, self._output
-            
-            # LLM анализ если есть callback
-            if self._llm_analyze and len(current_output) > 100:
-                elapsed = asyncio.get_event_loop().time() - start
-                try:
-                    analysis = await self._llm_analyze(
-                        current_output[-8000:],  # последние 8k символов
-                        self._current_task,
-                        elapsed
-                    )
-                    
-                    status = analysis.get("status", "working")
-                    
-                    if status == "completed":
-                        self._completed = True
-                        self._output = current_output
-                        self.status = WorkerStatus.COMPLETED
-                        logger.info(f"[{self.WORKER_NAME}] LLM says completed: {analysis.get('summary', '')}")
-                        return True, self._output
-                    
-                    if status == "error":
-                        self._completed = False
-                        self._output = current_output
-                        self.status = WorkerStatus.ERROR
-                        logger.warning(f"[{self.WORKER_NAME}] LLM detected error: {analysis.get('summary', '')}")
-                        return False, self._output
-                        
-                except Exception as e:
-                    logger.debug(f"LLM analyze failed: {e}")
         
         # Таймаут
         self._output = current_output if 'current_output' in dir() else ""

@@ -1,5 +1,9 @@
 """
 Copilot Worker - основной worker для GitHub Copilot CLI
+
+НАДЁЖНАЯ ДЕТЕКЦИЯ:
+- Non-interactive (`-p`): процесс завершается сам с exit code
+- Interactive (visible): паттерны + `--share` для сохранения результата
 """
 
 import asyncio
@@ -71,10 +75,11 @@ class TokenUsage:
 class CopilotWorker(BaseWorker):
     """Worker для GitHub Copilot CLI
     
-    Основной режим работы (opus). Используется для большинства задач.
-    Запускает `copilot -p "task"` в non-interactive режиме.
+    НАДЁЖНАЯ детекция завершения:
+    1. Non-interactive (-p): процесс завершается сам с exit code
+    2. Interactive (visible): паттерны + проверка exit code
     
-    В отличие от интерактивных CLI, copilot с -p выполняет задачу и завершается.
+    Copilot -p выполняет задачу и ЗАВЕРШАЕТСЯ - это надёжнее паттернов!
     """
     
     WORKER_NAME = "copilot"

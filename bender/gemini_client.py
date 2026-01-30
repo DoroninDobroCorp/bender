@@ -16,10 +16,10 @@ import httpx
 logger = logging.getLogger(__name__)
 
 # РАЗРЕШЁННЫЕ МОДЕЛИ - другие использовать ЗАПРЕЩЕНО!
+# Только gemini-3-flash и gemini-2.5-pro!
 ALLOWED_MODELS = [
-    "gemini-2.0-flash",      # Быстрая, для fallback
-    "gemini-2.5-pro",        # Продвинутая
-    "gemini-2.5-flash",      # Новая быстрая
+    "gemini-3-flash-preview",  # Gemini 3 Flash (быстрая)
+    "gemini-2.5-pro",          # Gemini 2.5 Pro (продвинутая)
 ]
 
 BASE_URL = "https://generativelanguage.googleapis.com/v1beta/models"

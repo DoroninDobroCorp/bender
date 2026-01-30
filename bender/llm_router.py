@@ -20,7 +20,7 @@ logger = logging.getLogger(__name__)
 
 # Модели
 CEREBRAS_MODEL = "qwen-3-235b-a22b-instruct-2507"
-GEMINI_MODEL = "gemini-2.0-flash"  # Быстрая, для fallback
+GEMINI_MODEL = "gemini-3-flash-preview"  # Gemini 3 Flash для fallback
 
 
 class KeyRotator:

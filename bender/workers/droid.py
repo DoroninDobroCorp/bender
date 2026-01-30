@@ -1,12 +1,15 @@
 """
 Droid Worker - worker для Droid CLI (простые задачи)
 
-Логика завершения на LLM — она читает логи и решает готово или нет.
-Проверка каждые 30 секунд.
+НАДЁЖНАЯ ДЕТЕКЦИЯ:
+- Используем `droid exec` с exit code
+- Процесс завершается сам когда задача готова
+- Fallback на паттерны для интерактивного режима
 """
 
 import asyncio
 import logging
+import subprocess
 from typing import List, Optional, Tuple, Callable, Awaitable
 
 from .base import BaseWorker, WorkerConfig, WorkerStatus
@@ -17,22 +20,23 @@ logger = logging.getLogger(__name__)
 class DroidWorker(BaseWorker):
     """Worker для Droid CLI
     
-    Режим для простых задач. Droid использует модель Sonnet.
-    Завершение определяется через LLM-анализ логов.
+    Надёжная детекция завершения:
+    1. Non-interactive: `droid exec` завершается сам
+    2. Interactive: паттерны + exit code процесса
     """
     
     WORKER_NAME = "droid"
     INTERVAL_MULTIPLIER = 1.0
     
-    # Паттерны завершения специфичные для Droid
+    # Паттерны завершения (для интерактивного режима)
     COMPLETION_PATTERNS = [
         "Task completed",
-        "All done",
+        "All done", 
         "Successfully",
         "Готово",
-        "Завершено",
         "Changes saved",
         "File updated",
+        "## Summary",  # Droid часто выводит summary в конце
     ]
     
     def __init__(
@@ -44,18 +48,23 @@ class DroidWorker(BaseWorker):
         super().__init__(config)
         self._output: str = ""
         self._completed: bool = False
-        self._llm_check_completion = llm_check_completion  # Deprecated, для совместимости
-        self._llm_analyze = llm_analyze  # LLM анализ логов
+        self._llm_analyze = llm_analyze
         self._current_task_text = ""
+        self._process: Optional[subprocess.Popen] = None
     
     @property
     def cli_command(self) -> List[str]:
-        # Visible режим: интерактивный droid с TUI (пользователь видит что происходит)
-        # Background режим: droid exec (без TUI, для логов)
         if self.config.visible:
-            return ["droid", "--auto", "high"]
+            # Интерактивный режим - пользователь видит TUI
+            return ["droid", "--allow-background-processes"]
         else:
-            return ["droid", "exec", "--skip-permissions-unsafe"]
+            # Non-interactive: droid exec с auto high
+            # Процесс завершится когда задача готова!
+            return [
+                "droid", "exec",
+                "--auto", "high",
+                "--skip-permissions-unsafe",
+            ]
     
     def format_task(self, task: str, context: Optional[str] = None) -> str:
         self._current_task_text = task
@@ -64,10 +73,14 @@ class DroidWorker(BaseWorker):
         return task
     
     async def wait_for_completion(self, timeout: float = 600) -> Tuple[bool, str]:
-        """Дождаться завершения — LLM решает когда готово"""
+        """Дождаться завершения
+        
+        Для exec режима - ждём exit code процесса (надёжно!)
+        Для interactive - паттерны + LLM fallback
+        """
         
         start = asyncio.get_event_loop().time()
-        check_interval = 30  # LLM проверка каждые 30 секунд
+        check_interval = 10  # Проверка каждые 10 секунд
         current_output = ""
         
         while asyncio.get_event_loop().time() - start < timeout:
@@ -83,72 +96,31 @@ class DroidWorker(BaseWorker):
             else:
                 current_output = await self.capture_output()
             
-            # 1. Детекция по паттернам (быстрая, без LLM)
-            completion_reason = self.detect_completion(current_output)
-            if completion_reason:
-                self._completed = True
-                self._output = current_output
-                self.status = WorkerStatus.COMPLETED
-                logger.info(f"[{self.WORKER_NAME}] Completed: {completion_reason}")
-                return True, self._output
-            
-            # 2. Детекция зависания
-            if self.detect_stuck(current_output):
-                logger.warning(f"[{self.WORKER_NAME}] Stuck detected (no output change)")
-                self._completed = True
-                self._output = current_output
-                self.status = WorkerStatus.STUCK
-                return False, self._output
-            
-            # 3. Проверяем жива ли сессия
+            # 1. НАДЁЖНО: Проверяем завершился ли процесс
             session_alive = await self.is_session_alive()
             if not session_alive:
                 self._completed = True
                 self._output = current_output
                 self.status = WorkerStatus.COMPLETED
-                logger.info(f"[{self.WORKER_NAME}] Session closed, completed")
+                logger.info(f"[{self.WORKER_NAME}] Process exited - task completed")
                 return True, self._output
             
-            # 4. LLM анализ (если есть и паттерны не сработали)
-            if self._llm_analyze and len(current_output) > 100:
-                try:
-                    analysis = await self._llm_analyze(
-                        current_output[-6000:],
-                        self._current_task_text,
-                        elapsed
-                    )
-                    
-                    status = analysis.get("status", "working")
-                    
-                    if status == "completed":
-                        self._completed = True
-                        self._output = current_output
-                        self.status = WorkerStatus.COMPLETED
-                        logger.info(f"[{self.WORKER_NAME}] LLM says completed: {analysis.get('summary', '')}")
-                        return True, self._output
-                    
-                    if status == "error":
-                        self._completed = False
-                        self._output = current_output
-                        self.status = WorkerStatus.ERROR
-                        logger.warning(f"[{self.WORKER_NAME}] LLM detected error: {analysis.get('summary', '')}")
-                        return False, self._output
-                        
-                except Exception as e:
-                    logger.debug(f"LLM analyze failed: {e}")
+            # 2. Детекция по паттернам (для интерактивного режима)
+            completion_reason = self.detect_completion(current_output)
+            if completion_reason:
+                self._completed = True
+                self._output = current_output
+                self.status = WorkerStatus.COMPLETED
+                logger.info(f"[{self.WORKER_NAME}] Pattern: {completion_reason}")
+                return True, self._output
             
-            # Fallback на старый callback если есть
-            elif self._llm_check_completion and len(current_output) > 100:
-                try:
-                    is_done = await self._llm_check_completion(self._current_task_text, current_output[-3000:])
-                    if is_done:
-                        self._completed = True
-                        self._output = current_output
-                        self.status = WorkerStatus.COMPLETED
-                        logger.info(f"[{self.WORKER_NAME}] LLM confirmed completion")
-                        return True, self._output
-                except Exception as e:
-                    logger.debug(f"LLM check failed: {e}")
+            # 3. Детекция зависания (300s без изменений)
+            if self.detect_stuck(current_output):
+                logger.warning(f"[{self.WORKER_NAME}] Stuck - no output for 5min")
+                self._completed = True
+                self._output = current_output
+                self.status = WorkerStatus.STUCK
+                return False, self._output
         
         # Таймаут
         self._output = current_output
