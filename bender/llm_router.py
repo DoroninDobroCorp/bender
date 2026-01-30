@@ -259,7 +259,7 @@ class LLMRouter:
             # Пауза перед повторной попыткой (после первой неудачи)
             if attempt > 0:
                 wait_time = 10 + attempt * 5  # 10, 15, 20 секунд
-                logger.info(f"🔄 Retry {attempt + 1}/{len(self.all_keys)}, waiting {wait_time}s")
+                logger.info(f"🔄 Retry {attempt + 1}/{len(self.all_keys)} with different key, waiting {wait_time}s")
                 await asyncio.sleep(wait_time)
             
             try:
@@ -268,19 +268,21 @@ class LLMRouter:
                     return response
             except RuntimeError as e:
                 if "wait required" in str(e):
-                    # Global rate limit - exponential backoff
-                    wait_time = 60 * (attempt + 1)  # 60, 120, 180 секунд
-                    logger.warning(f"⏳ Global rate limit, waiting {wait_time}s before retry (attempt {attempt + 1})")
-                    await asyncio.sleep(wait_time)
-                    # Retry this key after wait
-                    try:
-                        response = await self._try_with_key(api_key, "glm", prompt, temperature, json_mode, max_tokens)
-                        if response:
-                            return response
-                    except Exception:
-                        pass  # Continue to next key
+                    # x-should-retry=false: этот ключ в rate limit, переходим к следующему
+                    logger.warning(f"⏳ Key ...{api_key[-8:]} rate limited, trying next key")
+                    continue  # Следующий ключ!
                 else:
                     raise
+        
+        # Все ключи не сработали - ждём и пробуем ещё раз
+        logger.warning(f"All {len(self.all_keys)} keys failed, waiting 60s before final retry")
+        await asyncio.sleep(60)
+        
+        # Последняя попытка с первым ключом
+        api_key = self.all_keys[0]
+        response = await self._try_with_key(api_key, "glm", prompt, temperature, json_mode, max_tokens)
+        if response:
+            return response
         
         raise RuntimeError(f"All API keys failed (tried {len(self.all_keys)} keys)")
     

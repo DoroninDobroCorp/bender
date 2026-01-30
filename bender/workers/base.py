@@ -64,6 +64,23 @@ class BaseWorker(ABC):
     
     STARTUP_DELAY: float = 2.0  # Время на загрузку CLI перед отправкой задачи
     
+    # Паттерны завершения работы (переопределяются в наследниках)
+    COMPLETION_PATTERNS: List[str] = [
+        "Task completed",
+        "All done",
+        "Successfully",
+        "Готово",
+        "Завершено",
+    ]
+    
+    # Паттерны shell prompt (возврат в shell = завершение)
+    SHELL_PROMPT_PATTERNS: List[str] = [
+        r"\$ $",           # bash prompt
+        r"% $",            # zsh prompt
+        r"> $",            # generic prompt
+        r"vladimirdoronin@",  # user-specific
+    ]
+    
     def __init__(self, config: WorkerConfig):
         self.config = config
         self.session_id: str = f"bender-{self.WORKER_NAME}-{uuid.uuid4().hex[:8]}"
@@ -74,6 +91,48 @@ class BaseWorker(ABC):
         self._process: Optional[asyncio.subprocess.Process] = None
         self._monitor_task: Optional[asyncio.Task] = None
         self._log_file: Optional[Path] = None
+        self._last_output_len: int = 0
+        self._no_change_count: int = 0
+    
+    def detect_completion(self, output: str) -> Optional[str]:
+        """Детектировать завершение по паттернам в логе
+        
+        Returns:
+            Причина завершения или None если не завершено
+        """
+        import re
+        
+        # Проверяем последние 3000 символов
+        last_chunk = output[-3000:] if len(output) > 3000 else output
+        
+        # Проверяем паттерны завершения
+        for pattern in self.COMPLETION_PATTERNS:
+            if pattern in last_chunk:
+                return f"completion pattern: {pattern}"
+        
+        # Проверяем shell prompt в конце (последние 200 символов)
+        last_lines = output[-200:] if len(output) > 200 else output
+        for pattern in self.SHELL_PROMPT_PATTERNS:
+            if re.search(pattern, last_lines):
+                return f"shell prompt detected"
+        
+        return None
+    
+    def detect_stuck(self, output: str) -> bool:
+        """Детектировать зависание (лог не меняется)
+        
+        Returns:
+            True если зависло (нет изменений 3 раза подряд)
+        """
+        current_len = len(output)
+        if current_len == self._last_output_len:
+            self._no_change_count += 1
+            if self._no_change_count >= 3:
+                return True
+        else:
+            self._no_change_count = 0
+            self._last_output_len = current_len
+        return False
         
     @property
     def effective_interval(self) -> float:

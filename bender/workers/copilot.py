@@ -81,6 +81,17 @@ class CopilotWorker(BaseWorker):
     INTERVAL_MULTIPLIER = 1.0
     STARTUP_DELAY = 1.0
     
+    # Паттерны завершения специфичные для Copilot
+    COMPLETION_PATTERNS = [
+        "Task completed",
+        "All done",
+        "Successfully",
+        "Готово",
+        "Total usage est:",  # Статистика в конце
+        "API time spent:",   # Статистика в конце
+        "Premium request",   # Статистика в конце
+    ]
+    
     # Паттерны для парсинга статистики из вывода copilot
     TOKEN_PATTERN = re.compile(
         r'(\w[\w\-\.]+)\s+([\d.]+)k\s+in,\s+([\d.]+)\s+out,\s+([\d.]+)k\s+cached'
@@ -274,7 +285,25 @@ class CopilotWorker(BaseWorker):
             else:
                 current_output = ""
             
-            # Проверяем жива ли сессия
+            # 1. Детекция по паттернам (быстрая, без LLM)
+            completion_reason = self.detect_completion(current_output)
+            if completion_reason:
+                self._completed = True
+                self._output = current_output
+                self.status = WorkerStatus.COMPLETED
+                self.token_usage = self._parse_token_usage(self._output)
+                logger.info(f"[{self.WORKER_NAME}] Completed: {completion_reason}")
+                return True, self._output
+            
+            # 2. Детекция зависания
+            if self.detect_stuck(current_output):
+                logger.warning(f"[{self.WORKER_NAME}] Stuck detected (no output change)")
+                self._completed = True
+                self._output = current_output
+                self.status = WorkerStatus.STUCK
+                return False, self._output
+            
+            # 3. Проверяем жива ли сессия
             session_alive = await self.is_session_alive()
             if not session_alive:
                 self._completed = True
@@ -284,7 +313,7 @@ class CopilotWorker(BaseWorker):
                 logger.info(f"[{self.WORKER_NAME}] Session closed, completed")
                 return True, self._output
             
-            # LLM анализ
+            # 4. LLM анализ (если есть)
             if self._llm_analyze and len(current_output) > 100:
                 try:
                     analysis = await self._llm_analyze(
