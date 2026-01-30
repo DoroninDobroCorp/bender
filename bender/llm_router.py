@@ -20,11 +20,13 @@ FALLBACK_MODEL = "qwen-3-235b-a22b-instruct-2507"  # тот же, на случ�
 
 
 class RateLimiter:
-    """Simple rate limiter with minimum delay between requests"""
+    """Adaptive rate limiter - увеличивает delay при 429"""
     
     def __init__(self, requests_per_minute: int = 60):
         self.requests_per_minute = requests_per_minute
-        self.min_delay = 3.0  # Минимум 3 секунды между запросами (Cerebras строгий)
+        self.min_delay = 5.0  # Базовый delay 5 секунд
+        self.current_delay = self.min_delay
+        self.max_delay = 120.0  # Максимум 2 минуты между запросами
         self.last_request = 0.0
         self._lock = asyncio.Lock()
     
@@ -34,12 +36,21 @@ class RateLimiter:
             now = time.time()
             elapsed = now - self.last_request
             
-            if elapsed < self.min_delay:
-                wait_time = self.min_delay - elapsed
+            if elapsed < self.current_delay:
+                wait_time = self.current_delay - elapsed
                 logger.debug(f"Rate limit: waiting {wait_time:.1f}s between requests")
                 await asyncio.sleep(wait_time)
             
             self.last_request = time.time()
+    
+    def on_success(self):
+        """Успешный запрос - уменьшаем delay"""
+        self.current_delay = max(self.min_delay, self.current_delay * 0.8)
+    
+    def on_rate_limit(self):
+        """429 - увеличиваем delay"""
+        self.current_delay = min(self.max_delay, self.current_delay * 2)
+        logger.warning(f"Rate limit hit, increasing delay to {self.current_delay:.1f}s")
 
 
 class KeyRotator:
@@ -212,13 +223,15 @@ class LLMRouter:
             response = await client.generate(prompt, temperature, json_mode, max_tokens=max_tokens)
             self.stats[f"{model_type}_calls"] += 1
             self._last_provider = model_type
+            self.rate_limiter.on_success()  # Успех - можно уменьшить delay
             return response
         except Exception as e:
             error_str = str(e)
             self.stats[f"{model_type}_errors"] += 1
             
-            # При 429 помечаем ключ как failed
+            # При 429 помечаем ключ как failed и увеличиваем delay
             if "429" in error_str or "rate limit" in error_str.lower():
+                self.rate_limiter.on_rate_limit()  # Увеличить delay
                 await self.key_rotator.mark_failed(api_key)
                 self.stats["key_rotations"] += 1
                 
@@ -255,14 +268,17 @@ class LLMRouter:
                     return response
             except RuntimeError as e:
                 if "wait required" in str(e):
-                    # Global rate limit - wait and retry with same key
-                    wait_time = 30  # Ждём 30 секунд
-                    logger.info(f"⏳ Global rate limit, waiting {wait_time}s before retry")
+                    # Global rate limit - exponential backoff
+                    wait_time = 60 * (attempt + 1)  # 60, 120, 180 секунд
+                    logger.warning(f"⏳ Global rate limit, waiting {wait_time}s before retry (attempt {attempt + 1})")
                     await asyncio.sleep(wait_time)
                     # Retry this key after wait
-                    response = await self._try_with_key(api_key, "glm", prompt, temperature, json_mode, max_tokens)
-                    if response:
-                        return response
+                    try:
+                        response = await self._try_with_key(api_key, "glm", prompt, temperature, json_mode, max_tokens)
+                        if response:
+                            return response
+                    except Exception:
+                        pass  # Continue to next key
                 else:
                     raise
         
