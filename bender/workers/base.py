@@ -122,12 +122,12 @@ class BaseWorker(ABC):
         """Детектировать зависание (лог не меняется)
         
         Returns:
-            True если зависло (нет изменений 3 раза подряд)
+            True если зависло (нет изменений 10 раз подряд = ~5 минут)
         """
         current_len = len(output)
         if current_len == self._last_output_len:
             self._no_change_count += 1
-            if self._no_change_count >= 3:
+            if self._no_change_count >= 10:  # 10 * 30s = 300s = 5 минут
                 return True
         else:
             self._no_change_count = 0

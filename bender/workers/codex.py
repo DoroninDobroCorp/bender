@@ -103,10 +103,10 @@ class CodexWorker(BaseWorker):
                     logger.info(f"[{self.WORKER_NAME}] Completion pattern found: '{pattern}'")
                     return True, self._output
             
-            # Детекция зависания: если лог не меняется 3 раза подряд (90 секунд)
+            # Детекция зависания: если лог не меняется 10 раз подряд (5 минут)
             if len(current_output) == last_output_len:
                 no_change_count += 1
-                if no_change_count >= 3:
+                if no_change_count >= 10:  # 10 * 30s = 300s = 5 минут
                     logger.warning(f"[{self.WORKER_NAME}] Log unchanged for {no_change_count * check_interval}s, assuming stuck")
                     self._completed = True
                     self._output = current_output
