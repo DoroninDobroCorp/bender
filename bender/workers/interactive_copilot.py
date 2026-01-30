@@ -312,9 +312,14 @@ script -q {shlex.quote(str(self._log_file))} copilot --model {shlex.quote(self.m
                 logger.debug(f"LogWatcher failed, using fallback: {e}")
         
         # Fallback: последняя значимая строка лога
-        lines = [l.strip() for l in output.split('\n') if l.strip() and len(l.strip()) > 5]
+        # Полная очистка ANSI/terminal escape sequences
+        clean_output = re.sub(r'\x1b\[[0-9;?]*[a-zA-Z]', '', output)  # CSI sequences
+        clean_output = re.sub(r'\x1b\][^\x07\x1b]*(?:\x07|\x1b\\)?', '', clean_output)  # OSC sequences
+        clean_output = re.sub(r'\x1b[=>]', '', clean_output)  # Mode switches
+        clean_output = re.sub(r'[\x00-\x08\x0b\x0c\x0e-\x1f\x7f]', '', clean_output)  # Control chars
+        
+        lines = [l.strip() for l in clean_output.split('\n') if l.strip() and len(l.strip()) > 5]
         last_meaningful = lines[-1][:80] if lines else "working..."
-        last_meaningful = re.sub(r'\x1b\[[0-9;]*m', '', last_meaningful)
         
         status_msg = f"⏳ [{elapsed}s] {last_meaningful}"
         

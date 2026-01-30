@@ -161,10 +161,13 @@ class LogFilter:
     
     def filter(self, raw_log: str) -> FilteredLog:
         """Отфильтровать лог"""
-        # Сначала удаляем ANSI escape-коды
+        # Полная очистка ANSI/terminal escape sequences
         import re as re_module
-        clean_log = re_module.sub(r'\x1b\[[0-9;]*[mKHJG]', '', raw_log)
-        clean_log = re_module.sub(r'[\x00-\x08\x0b\x0c\x0e-\x1f\x7f]', '', clean_log)
+        clean_log = re_module.sub(r'\x1b\[[0-9;?]*[a-zA-Z]', '', raw_log)  # CSI sequences
+        clean_log = re_module.sub(r'\x1b\][^\x07\x1b]*(?:\x07|\x1b\\)?', '', clean_log)  # OSC sequences
+        clean_log = re_module.sub(r'\x1b[=>]', '', clean_log)  # Mode switches
+        clean_log = re_module.sub(r'\x1b\([A-Z0-9]', '', clean_log)  # Charset switches
+        clean_log = re_module.sub(r'[\x00-\x08\x0b\x0c\x0e-\x1f\x7f]', '', clean_log)  # Control chars
         
         lines = clean_log.split('\n')
         filtered_lines: List[str] = []

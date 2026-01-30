@@ -593,8 +593,12 @@ class ReviewLoopManager:
                             if output and len(output) > 100:
                                 # Сначала пробуем без GLM - ищем прогресс в логе
                                 import re
-                                clean_output = re.sub(r'\x1b\[[0-9;]*[mKHJG]', '', output)
-                                clean_output = re.sub(r'[\x00-\x1f\x7f]', '', clean_output)
+                                # Полная очистка ANSI/terminal escape sequences
+                                clean_output = re.sub(r'\x1b\[[0-9;?]*[a-zA-Z]', '', output)  # CSI sequences
+                                clean_output = re.sub(r'\x1b\][^\x07\x1b]*(?:\x07|\x1b\\)?', '', clean_output)  # OSC sequences
+                                clean_output = re.sub(r'\x1b[=>]', '', clean_output)  # Mode switches
+                                clean_output = re.sub(r'\x1b\([A-Z0-9]', '', clean_output)  # Charset switches
+                                clean_output = re.sub(r'[\x00-\x08\x0b\x0c\x0e-\x1f\x7f]', '', clean_output)  # Control chars
                                 
                                 # Ищем признаки прогресса
                                 progress_patterns = [
@@ -645,15 +649,35 @@ class ReviewLoopManager:
                                         logger.warning(f"LogWatcher failed: {e}")
                                 
                                 # Fallback: показываем последнюю значимую строку лога
-                                lines = [l.strip() for l in clean_output.split('\n') 
-                                         if l.strip() and len(l.strip()) > 20 
-                                         and '? for help' not in l
-                                         and 'shift+tab' not in l.lower()
-                                         and 'ctrl+' not in l.lower()
-                                         and not l.strip().startswith('�')]
+                                # Исключаем TUI-мусор и escape-последовательности
+                                lines = []
+                                for l in clean_output.split('\n'):
+                                    l = l.strip()
+                                    if not l or len(l) < 10:
+                                        continue
+                                    # Исключаем TUI-мусор
+                                    skip_patterns = ['? for help', 'shift+tab', 'ctrl+', '╭', '╮', '╰', '╯', '│', '─',
+                                                     '[?', '[>', 'c]', '�', 'Tip:', '/model', '/experimental']
+                                    if any(p in l.lower() or p in l for p in skip_patterns):
+                                        continue
+                                    # Исключаем строки с box drawing или спецсимволами
+                                    if re.match(r'^[╭╮╰╯│─\s]+$', l):
+                                        continue
+                                    # Оставляем только осмысленные строки
+                                    if len(l) > 20 and not l.startswith('[') and not re.match(r'^[\s\W]+$', l):
+                                        lines.append(l)
+                                
                                 if lines:
-                                    last_line = lines[-1][:50]
-                                    await self._report(f"⏳ [{elapsed}s] └ {last_line}")
+                                    # Ищем строку с действием (Read, Search, Exploring и т.д.)
+                                    action_line = None
+                                    for line in reversed(lines[-20:]):
+                                        if any(kw in line for kw in ['Read', 'Search', 'Exploring', 'Writing', 'Creating', 'Analyzing', 'Checking']):
+                                            action_line = line[:60]
+                                            break
+                                    if action_line:
+                                        await self._report(f"⏳ [{elapsed}s] {action_line}")
+                                    else:
+                                        await self._report(f"⏳ [{elapsed}s] {worker_name} анализирует...")
                                 else:
                                     await self._report(f"⏳ [{elapsed}s] {worker_name} работает...")
                             else:
