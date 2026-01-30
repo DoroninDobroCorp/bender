@@ -379,6 +379,12 @@ script -q {shlex.quote(str(self._log_file))} copilot --model {shlex.quote(self.m
             await asyncio.sleep(check_interval)
             elapsed = time.time() - start
             
+            # Проверяем жив ли терминал
+            if not await self.is_session_alive():
+                logger.warning(f"[{self.WORKER_NAME}] Terminal died after {int(elapsed)}s")
+                self.status = WorkerStatus.ERROR
+                return False, await self.capture_full_scrollback()
+            
             # Если status уже установлен монитором
             if self.status == WorkerStatus.COMPLETED:
                 return True, await self.capture_full_scrollback()
@@ -545,7 +551,34 @@ script -q {shlex.quote(str(self._log_file))} copilot --model {shlex.quote(self.m
     
     async def is_session_alive(self) -> bool:
         """Проверить живой ли терминал"""
-        # Проверяем обновляется ли лог-файл
+        # 1. Проверяем существует ли окно терминала
+        if self._terminal_window_id:
+            try:
+                check_script = f'''
+                tell application "Terminal"
+                    try
+                        set w to first window whose id is {self._terminal_window_id}
+                        return "alive"
+                    on error
+                        return "dead"
+                    end try
+                end tell
+                '''
+                proc = await asyncio.subprocess.create_subprocess_exec(
+                    "osascript", "-e", check_script,
+                    stdout=asyncio.subprocess.PIPE,
+                    stderr=asyncio.subprocess.PIPE
+                )
+                stdout, _ = await asyncio.wait_for(proc.communicate(), timeout=5.0)
+                if "dead" in stdout.decode():
+                    logger.warning(f"[{self.WORKER_NAME}] Terminal window {self._terminal_window_id} is dead")
+                    return False
+            except asyncio.TimeoutError:
+                pass  # Terminal app might be slow, continue with log check
+            except Exception as e:
+                logger.debug(f"Terminal window check failed: {e}")
+        
+        # 2. Проверяем обновляется ли лог-файл
         if not self._log_file or not self._log_file.exists():
             return False
         try:
