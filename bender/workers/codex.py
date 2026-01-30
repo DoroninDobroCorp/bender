@@ -56,19 +56,12 @@ class CodexWorker(BaseWorker):
     
     @property
     def cli_command(self) -> List[str]:
-        if self.config.visible:
-            # Интерактивный режим
-            return [
-                "codex",
-                "--dangerously-bypass-approvals-and-sandbox",
-            ]
-        else:
-            # Non-interactive: codex exec (завершается сам!)
-            return [
-                "codex", "exec",
-                "--dangerously-bypass-approvals-and-sandbox",
-                "--full-auto",
-            ]
+        # Всегда используем exec --full-auto для надёжного завершения
+        # exec выходит когда закончит работу
+        return [
+            "codex", "exec",
+            "--full-auto",
+        ]
     
     def format_task(self, task: str, context: Optional[str] = None) -> str:
         self._current_task = task

@@ -54,17 +54,13 @@ class DroidWorker(BaseWorker):
     
     @property
     def cli_command(self) -> List[str]:
-        if self.config.visible:
-            # Интерактивный режим - пользователь видит TUI
-            return ["droid", "--allow-background-processes"]
-        else:
-            # Non-interactive: droid exec с auto high
-            # Процесс завершится когда задача готова!
-            return [
-                "droid", "exec",
-                "--auto", "high",
-                "--skip-permissions-unsafe",
-            ]
+        # Всегда используем exec для надёжного завершения
+        # exec показывает прогресс и выходит когда закончит
+        return [
+            "droid", "exec",
+            "--auto", "high",
+            "--skip-permissions-unsafe",
+        ]
     
     def format_task(self, task: str, context: Optional[str] = None) -> str:
         self._current_task_text = task
