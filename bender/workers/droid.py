@@ -55,11 +55,10 @@ class DroidWorker(BaseWorker):
     @property
     def cli_command(self) -> List[str]:
         # Всегда используем exec для надёжного завершения
-        # exec показывает прогресс и выходит когда закончит
+        # --auto high даёт полную автономию
         return [
             "droid", "exec",
             "--auto", "high",
-            "--skip-permissions-unsafe",
         ]
     
     def format_task(self, task: str, context: Optional[str] = None) -> str:
