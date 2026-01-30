@@ -457,6 +457,33 @@ class TaskManager:
             except Exception:
                 session_alive = True
             if not session_alive:
+                # Сессия завершилась - проверим done файл для успешного завершения
+                worker = self.worker_manager.current_worker
+                done_file = getattr(worker, '_done_file', None)
+                if done_file and done_file.exists():
+                    try:
+                        exit_code = int(done_file.read_text().strip())
+                        if exit_code == 0:
+                            # Успешное завершение!
+                            logger.info(f"[TaskManager] Worker completed with exit code 0")
+                            return WatcherAnalysis(
+                                result=AnalysisResult.COMPLETED,
+                                summary="Task completed successfully",
+                                suggestion="",
+                                should_restart=False,
+                            )
+                        else:
+                            logger.warning(f"[TaskManager] Worker failed with exit code {exit_code}")
+                            return WatcherAnalysis(
+                                result=AnalysisResult.ERROR,
+                                summary=f"Worker exited with code {exit_code}",
+                                suggestion="Check logs for errors",
+                                should_restart=True,
+                            )
+                    except (ValueError, IOError):
+                        pass
+                
+                # Нет done файла - попробуем recovery
                 recovered = await self._attempt_console_recovery("Сессия терминала не отвечает", raw_log)
                 if recovered:
                     continue
