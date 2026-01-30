@@ -412,7 +412,34 @@ class TaskManager:
             
             # Проверить жив ли worker
             if not self.worker_manager.is_running:
-                # Сессия умерла - нужен restart
+                # Worker не running - проверим done файл для успешного завершения
+                worker = self.worker_manager.current_worker
+                done_file = getattr(worker, '_done_file', None)
+                if done_file and done_file.exists():
+                    try:
+                        exit_code = int(done_file.read_text().strip())
+                        raw_log = await worker.capture_output()
+                        if exit_code == 0:
+                            # Успешное завершение!
+                            logger.info(f"[TaskManager] Worker completed with exit code 0")
+                            return WatcherAnalysis(
+                                result=AnalysisResult.COMPLETED,
+                                summary="Task completed successfully",
+                                suggestion="",
+                                should_restart=False,
+                            )
+                        else:
+                            logger.warning(f"[TaskManager] Worker failed with exit code {exit_code}")
+                            return WatcherAnalysis(
+                                result=AnalysisResult.ERROR,
+                                summary=f"Worker exited with code {exit_code}",
+                                suggestion="Check logs for errors",
+                                should_restart=True,
+                            )
+                    except (ValueError, IOError):
+                        pass
+                
+                # Нет done файла или ошибка чтения - сессия умерла
                 return WatcherAnalysis(
                     result=AnalysisResult.ERROR,
                     summary="Worker session died",
