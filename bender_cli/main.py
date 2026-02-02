@@ -30,6 +30,16 @@ from core.config import load_config
 from core.logging_config import setup_logging
 
 
+def clean_surrogates(text: str) -> str:
+    """Remove surrogate characters that can't be encoded in UTF-8 (from broken terminal/tmux input)"""
+    if not text:
+        return text
+    try:
+        return text.encode('utf-8', errors='replace').decode('utf-8')
+    except Exception:
+        return ''.join(char for char in text if not (0xD800 <= ord(char) <= 0xDFFF))
+
+
 # Bender ASCII Art
 BENDER_ASCII = r"""
     ╭──────────────────────────────────╮
@@ -118,8 +128,7 @@ def cli(ctx, debug):
 @click.option('--auto', '-a', is_flag=True, default=True, help='Auto-select worker by complexity (default)')
 @click.option('--interval', '-i', type=int, default=60, help='Log check interval in seconds')
 @click.option('--simple', '-s', is_flag=True, help='Skip clarification and verification')
-@click.option('--visible', '-v', is_flag=True, help='Show terminal windows')
-@click.option('--interactive', '-I', is_flag=True, help='Use interactive copilot mode (full terminal, can continue manually)')
+@click.option('--visible', '-v', is_flag=True, help='Show terminal windows (tmux)')
 @click.option('--review-loop', '-l', is_flag=True, help='Iterative copilot→codex loop until clean')
 @click.option('--copilot-review', '-c', is_flag=True, help='Use copilot instead of codex for review (saves codex limits)')
 @click.option('--droid-mode', '-d', is_flag=True, help='Use droid (Sonnet) for BOTH execution and review - faster & cheaper!')
@@ -128,7 +137,7 @@ def cli(ctx, debug):
 @click.option('--errors-interactive', '-E', is_flag=True, help='Enter errors interactively (line by line)')
 @click.option('--project', '-p', type=click.Path(exists=True), help='Project path')
 @click.pass_context
-def run(ctx, task, droid, opus, codex, auto, interval, simple, visible, interactive, review_loop, copilot_review, droid_mode, max_iterations, continue_errors, errors_interactive, project):
+def run(ctx, task, droid, opus, codex, auto, interval, simple, visible, review_loop, copilot_review, droid_mode, max_iterations, continue_errors, errors_interactive, project):
     """Run a task with Bender supervision
     
     TASK can be omitted - Bender will ask interactively.
@@ -141,18 +150,18 @@ def run(ctx, task, droid, opus, codex, auto, interval, simple, visible, interact
     
     Use --simple to skip analysis and verification.
     Use --droid or --codex to force a specific worker.
-    Use --interactive (-I) for full terminal mode (can continue manually if bender stops).
     Use --review-loop for iterative copilot→codex→copilot cycle.
     Use --copilot-review (-c) with --review-loop to use copilot for review.
     Use --droid-mode (-d) to use droid (Sonnet) for BOTH execution and review - faster!
     Use -E to enter errors interactively, or -C "errors" to pass directly.
+    Use -v to show tmux terminal windows.
     
     Examples:
         bender run "Add OAuth authentication"
-        bender run -lvI             # Interactive mode with visible terminal
-        bender run -lvc              # Loop with copilot
-        bender run -lvD              # Loop with droid (faster!)
-        bender run -lvcE             # Interactive task + errors
+        bender run -lv               # Loop with visible terminal
+        bender run -lvc              # Loop with copilot review
+        bender run -lvd              # Loop with droid (faster!)
+        bender run -lvE              # Loop + errors interactive
         bender run -lvc -C "bug1, bug2" "task"
     """
     
@@ -189,7 +198,7 @@ def run(ctx, task, droid, opus, codex, auto, interval, simple, visible, interact
             click.echo("❌ No task provided")
             return
         
-        task = "\n".join(lines)
+        task = clean_surrogates("\n".join(lines))
         click.echo()
     
     # Interactive errors mode: -E flag
@@ -220,9 +229,13 @@ def run(ctx, task, droid, opus, codex, auto, interval, simple, visible, interact
         except KeyboardInterrupt:
             pass
         if lines:
-            # Join with newline to preserve structure, then clean up
-            continue_errors = "\n".join(lines)
+            # Join with newline to preserve structure, then clean up surrogates
+            continue_errors = clean_surrogates("\n".join(lines))
         click.echo()
+    
+    # Очищаем task от битой кодировки (если передан как аргумент)
+    if task:
+        task = clean_surrogates(task)
     
     # Track if -E was used but no errors provided (review-first mode)
     review_first_mode = errors_interactive and not continue_errors
@@ -256,22 +269,18 @@ def run(ctx, task, droid, opus, codex, auto, interval, simple, visible, interact
     click.echo(f"🤖 Bender starting...")
     if review_loop:
         reviewer = "copilot" if copilot_review else "codex"
-        mode_str = "INTERACTIVE" if interactive else "REVIEW LOOP"
-        click.echo(f"   Mode: {mode_str} (copilot→{reviewer}→copilot, max {max_iterations} iterations)")
-        if interactive:
-            click.echo(f"   ⚡ Interactive mode: full terminal, can continue manually")
+        click.echo(f"   Mode: REVIEW LOOP (copilot→{reviewer}→copilot, max {max_iterations} iterations)")
         if continue_errors:
             click.echo(f"   Continue mode: will fix initial errors first")
         elif review_first_mode:
             click.echo(f"   Review-first mode: task assumed done, searching for errors")
-    elif interactive:
-        click.echo(f"   Mode: INTERACTIVE (native terminal)")
-        click.echo(f"   ⚡ Terminal closes after completion")
     elif worker_type:
         click.echo(f"   Worker: {worker_type} (forced)")
     else:
         click.echo(f"   Worker: auto-select by complexity")
     click.echo(f"   Interval: {interval}s")
+    if visible:
+        click.echo(f"   Terminal: visible (tmux)")
     if not review_loop:
         click.echo(f"   Mode: {'simple (no verification)' if simple else 'full (with clarification & verification)'}")
     click.echo(f"   Task: {task[:60]}{'...' if len(task) > 60 else ''}")
@@ -308,29 +317,25 @@ def run(ctx, task, droid, opus, codex, auto, interval, simple, visible, interact
                     initial_errors.append(e)
     
     if review_loop:
-        # Review loop mode (with or without interactive)
-        asyncio.run(_run_review_loop(task, max_iterations, visible, project, copilot_review, droid_mode, initial_errors, ctx.obj.get('debug', False), review_first_mode, interactive, interval, simple))
-    elif interactive:
-        # Interactive mode WITHOUT review loop - just run task in native terminal
-        asyncio.run(_run_interactive_simple(task, visible, project, simple, ctx.obj.get('debug', False), interval))
+        # Review loop mode
+        asyncio.run(_run_review_loop(task, max_iterations, visible, project, copilot_review, droid_mode, initial_errors, ctx.obj.get('debug', False), review_first_mode, interval, simple))
     else:
         asyncio.run(_run_task(task, worker_type, interval, simple, visible, project, ctx.obj.get('debug', False)))
 
 
-async def _run_review_loop(task: str, max_iterations: int, visible: bool, project_path: Optional[str], use_copilot_reviewer: bool = False, use_droid_mode: bool = False, initial_errors: Optional[list] = None, debug: bool = False, skip_first_execution: bool = False, use_interactive: bool = False, status_interval: int = 60, skip_llm_analysis: bool = False):
+async def _run_review_loop(task: str, max_iterations: int, visible: bool, project_path: Optional[str], use_copilot_reviewer: bool = False, use_droid_mode: bool = False, initial_errors: Optional[list] = None, debug: bool = False, skip_first_execution: bool = False, status_interval: int = 60, skip_llm_analysis: bool = False):
     """Run iterative review loop: worker → reviewer → worker
     
     Args:
         task: The task to perform
         max_iterations: Maximum number of review iterations
-        visible: Show terminal windows
+        visible: Show terminal windows (tmux)
         project_path: Path to project
         use_copilot_reviewer: Use copilot instead of codex for review
         use_droid_mode: Use droid (Sonnet) for BOTH execution and review
         initial_errors: List of initial errors for continue mode
         debug: Enable debug output
         skip_first_execution: Skip first execution, go straight to review
-        use_interactive: Use interactive copilot mode (full terminal)
         status_interval: How often to report status (seconds)
         skip_llm_analysis: Skip GLM analysis (simple mode)
     """
@@ -362,7 +367,6 @@ async def _run_review_loop(task: str, max_iterations: int, visible: bool, projec
         project_path=proj_path,
         check_interval=60.0,
         visible=visible,
-        interactive_mode=use_interactive,
         status_interval=float(status_interval),
     )
     
@@ -374,11 +378,9 @@ async def _run_review_loop(task: str, max_iterations: int, visible: bool, projec
         response = click.prompt("Your response")
         return response
     
-    # Определяем режим: droid или copilot
+    # Определяем режим
     if use_droid_mode:
         click.echo("🤖 Mode: DROID (Sonnet) for both execution and review")
-    elif use_interactive:
-        click.echo("🤖 Mode: INTERACTIVE COPILOT (full terminal)")
     
     loop_manager = ReviewLoopManager(
         llm=llm,
@@ -386,7 +388,6 @@ async def _run_review_loop(task: str, max_iterations: int, visible: bool, projec
         on_status=on_status,
         on_question=on_ask_user,
         use_copilot_reviewer=use_copilot_reviewer,
-        use_interactive=use_interactive,
         skip_llm=skip_llm_analysis,
         use_droid_mode=use_droid_mode,
         skip_first_execution=skip_first_execution,
@@ -426,102 +427,8 @@ async def _run_review_loop(task: str, max_iterations: int, visible: bool, projec
             import traceback
             traceback.print_exc()
     finally:
-        await llm.close()
-
-
-async def _run_interactive_simple(task: str, visible: bool, project_path: Optional[str], simple: bool, debug: bool = False, status_interval: int = 60):
-    """Run task in interactive native terminal mode (no review loop)
-    
-    This opens a native Terminal.app window with copilot, runs the task,
-    and closes the terminal when done.
-    """
-    global _shutdown_event
-    
-    _shutdown_event = asyncio.Event()
-    signal.signal(signal.SIGINT, handle_shutdown)
-    signal.signal(signal.SIGTERM, handle_shutdown)
-    
-    try:
-        config = load_config()
-    except Exception as e:
-        click.echo(f"❌ Config error: {e}", err=True)
-        sys.exit(1)
-    
-    from pathlib import Path
-    proj_path = Path(project_path) if project_path else Path.cwd()
-    
-    from bender.workers.interactive_copilot import InteractiveCopilotWorker
-    from bender.workers.base import WorkerConfig, WorkerStatus
-    from bender.task_clarifier import TaskClarifier
-    from bender.llm_router import LLMRouter
-    
-    # Create LLM for task clarification
-    api_keys = config.api_keys_list if config.api_keys_list else None
-    gemini_keys = config.gemini_keys_list if config.gemini_keys_list else None
-    llm = LLMRouter(config.glm_api_key, requests_per_minute=30, api_keys=api_keys, gemini_api_keys=gemini_keys)
-    
-    async def on_status(message: str):
-        bender_echo(message)
-    
-    click.echo("🤖 Mode: INTERACTIVE COPILOT (native terminal)")
-    
-    # Clarify task if not simple mode
-    clarified_task = task
-    if not simple:
-        clarifier = TaskClarifier(llm, str(proj_path))
-        bender_echo("Analyzing task...")
-        result = await clarifier.analyze(task)
-        if result:
-            bender_echo(f"Complexity: {result.complexity.value}")
-            bender_echo(f"Criteria: {len(result.acceptance_criteria)} items")
-            # Format task with criteria
-            criteria_text = "\n".join([f"- {c}" for c in result.acceptance_criteria])
-            clarified_task = f"""{result.clarified_task}
-
-Критерии приёмки:
-{criteria_text}
-
-Выполни ВСЕ пункты. После завершения проверь что каждый критерий выполнен."""
-    
-    # Create worker config
-    worker_config = WorkerConfig(
-        project_path=proj_path,
-        check_interval=float(status_interval),
-        visible=True,  # Always visible for interactive
-        simple_mode=simple,
-    )
-    
-    # Create interactive worker
-    worker = InteractiveCopilotWorker(
-        config=worker_config,
-        on_status=on_status,
-        auto_allow_tools=True,
-        status_interval=float(status_interval),
-    )
-    
-    try:
-        # Start the worker
-        await worker.start(clarified_task)
-        bender_echo("Task sent to copilot in native terminal")
-        
-        # Wait for completion
-        success, output = await worker.wait_for_completion(timeout=1800)
-        
-        if success:
-            bender_echo("✅ Task completed successfully!")
-        else:
-            bender_echo("⚠️ Task may not have completed (timeout or error)")
-        
-    except asyncio.CancelledError:
-        click.echo("\n⚠️  Cancelled")
-    except Exception as e:
-        click.echo(f"\n❌ Error: {e}", err=True)
-        if debug:
-            import traceback
-            traceback.print_exc()
-    finally:
-        # Stop and close terminal
-        await worker.stop()
+        # Закрыть терминал и очистить ресурсы
+        await loop_manager.cleanup()
         await llm.close()
 
 

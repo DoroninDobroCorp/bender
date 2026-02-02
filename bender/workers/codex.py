@@ -32,17 +32,14 @@ class CodexWorker(BaseWorker):
     INTERVAL_MULTIPLIER = 2.0
     
     # Паттерны завершения (для интерактивного режима)
+    # ВАЖНО: НЕ ставить паттерны которые есть в промпте!
+    # "Проблем не найдено" есть в инструкции, поэтому его нельзя использовать
     COMPLETION_PATTERNS = [
-        "Проблем не найдено",
         "No issues found",
-        "Task completed",
-        "All done",
-        "CRITICAL:",
-        "HIGH:",
-        "Findings:",
-        "Summary:",
-        "vladimirdoronin@",  # Shell prompt
-        "$ exit",
+        "Task completed successfully",
+        "All tasks completed", 
+        "Review finished",
+        "vladimirdoronin@",  # Shell prompt (процесс завершился)
     ]
     
     def __init__(
@@ -58,9 +55,11 @@ class CodexWorker(BaseWorker):
     def cli_command(self) -> List[str]:
         # Всегда используем exec --full-auto для надёжного завершения
         # exec выходит когда закончит работу
+        # --skip-git-repo-check нужен чтобы не требовать "доверенную" директорию
         return [
             "codex", "exec",
             "--full-auto",
+            "--skip-git-repo-check",
         ]
     
     def format_task(self, task: str, context: Optional[str] = None) -> str:
@@ -112,16 +111,20 @@ class CodexWorker(BaseWorker):
                 logger.info(f"[{self.WORKER_NAME}] Process exited - task completed")
                 return True, self._output
             
-            # 2. Детекция по паттернам (очищаем ANSI коды!)
-            last_chunk = current_output[-5000:] if len(current_output) > 5000 else current_output
-            clean_chunk = ANSI_ESCAPE.sub('', last_chunk)
-            for pattern in self.COMPLETION_PATTERNS:
-                if pattern in clean_chunk:
-                    self._completed = True
-                    self._output = current_output
-                    self.status = WorkerStatus.COMPLETED
-                    logger.info(f"[{self.WORKER_NAME}] Pattern: '{pattern}'")
-                    return True, self._output
+            # 2. Детекция по паттернам (только после 30+ секунд работы!)
+            # Паттерны могут встречаться в инструкциях/промпте в начале
+            elapsed = asyncio.get_event_loop().time() - start
+            if elapsed > 30 and len(current_output) > 1000:
+                # Смотрим только последние 2000 символов чтобы не путать с промптом
+                last_chunk = current_output[-2000:]
+                clean_chunk = ANSI_ESCAPE.sub('', last_chunk)
+                for pattern in self.COMPLETION_PATTERNS:
+                    if pattern in clean_chunk:
+                        self._completed = True
+                        self._output = current_output
+                        self.status = WorkerStatus.COMPLETED
+                        logger.info(f"[{self.WORKER_NAME}] Pattern: '{pattern}'")
+                        return True, self._output
             
             # 3. Детекция зависания (300s без изменений)
             if len(current_output) == last_output_len:

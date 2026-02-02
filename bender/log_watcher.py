@@ -117,6 +117,11 @@ class LogWatcher:
         # Обрезаем лог
         trimmed_log = self.context.tail_log(raw_log)
         
+        # Проверяем copilot completion ПЕРЕД фильтрацией (filter убирает "Type @")
+        copilot_result = self._check_copilot_completion(trimmed_log)
+        if copilot_result:
+            return copilot_result
+        
         # Фильтруем шум
         filtered = self.filter.filter(trimmed_log)
         log_content = filtered.model_messages
@@ -183,9 +188,48 @@ class LogWatcher:
             suggestion=None,
         )
     
+    def _check_copilot_completion(self, raw_log: str) -> Optional[WatcherAnalysis]:
+        """Проверка завершения для Copilot (до фильтрации!)
+        
+        Copilot после ответа показывает:
+        ● <ответ>
+        ...
+        Type @ to mention files
+        
+        Фильтр убирает "Type @" поэтому проверяем raw лог.
+        """
+        last_chunk = raw_log[-3000:] if len(raw_log) > 3000 else raw_log
+        
+        # Copilot дал ответ (●) и вернулся к prompt
+        if "●" in last_chunk and "Type @ to mention" in last_chunk:
+            answer_pos = last_chunk.rfind("●")
+            prompt_pos = last_chunk.rfind("Type @ to mention")
+            if answer_pos < prompt_pos:
+                logger.info("[LogWatcher] Copilot completion: answered and returned to prompt")
+                return WatcherAnalysis(
+                    result=AnalysisResult.COMPLETED,
+                    summary="Copilot завершил задачу",
+                    suggestion=None,
+                )
+        return None
+    
     def _analyze_by_patterns(self, log: str) -> Optional[WatcherAnalysis]:
         """Анализ по паттернам (без LLM!)"""
         last_chunk = log[-2000:] if len(log) > 2000 else log
+        
+        # Специальная проверка для Copilot interactive:
+        # Если есть ответ (●) и после него prompt - задача завершена
+        if "●" in last_chunk and "Type @ to mention" in last_chunk:
+            # Проверяем что ● идёт ПЕРЕД prompt (ответ был дан)
+            answer_pos = last_chunk.rfind("●")
+            prompt_pos = last_chunk.rfind("Type @ to mention")
+            if answer_pos < prompt_pos:
+                logger.debug("[LogWatcher] Copilot answered and returned to prompt")
+                return WatcherAnalysis(
+                    result=AnalysisResult.COMPLETED,
+                    summary="Copilot дал ответ и готов к новой задаче",
+                    suggestion=None,
+                )
         
         # Паттерны завершения (Copilot, Codex, Droid)
         completion_patterns = [

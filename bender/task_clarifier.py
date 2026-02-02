@@ -10,6 +10,7 @@ from typing import Optional, List, Callable, Awaitable
 from enum import Enum
 
 from .llm_router import LLMRouter
+from .glm_client import clean_surrogates
 
 logger = logging.getLogger(__name__)
 
@@ -102,6 +103,8 @@ class TaskClarifier:
         Returns:
             ClarifiedTask с ОРИГИНАЛЬНОЙ задачей и acceptance criteria (только если одобрены)
         """
+        # Очищаем от суррогатных символов (битая кодировка из терминала/tmux)
+        task = clean_surrogates(task)
         logger.info(f"[Clarifier] Analyzing task: {task[:50]}...")
         
         # Проверяем есть ли указание не спрашивать

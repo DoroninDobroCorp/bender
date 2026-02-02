@@ -246,28 +246,63 @@ class BaseWorker(ABC):
         log_file_path = shlex.quote(str(self._log_file))
         
         # Wrapper: запускаем через script для логов, но пишем exit code в .done
+        # ВАЖНО: задача читается из файла чтобы избежать проблем с экранированием
+        # кавычек, скобок и спецсимволов в тексте задачи
+        task_file_escaped = shlex.quote(str(task_file))
         if self.WORKER_NAME in ("copilot", "copilot-interactive"):
-            # copilot -p "task"
-            cmd_with_task = f'{cli_cmd} -p "$(cat {shlex.quote(str(task_file))})"'
-            script_content = f'''#!/bin/bash
+            # Для copilot: базовая команда БЕЗ задачи, задача добавляется из файла
+            base_cmd = shlex.join(["copilot", "--allow-all", "--model", getattr(self, 'model', 'claude-opus-4.5')])
+            # Создаём внутренний скрипт чтобы избежать проблем с вложенными кавычками
+            inner_script = Path(tempfile.gettempdir()) / f"bender-inner-{self.session_id}.sh"
+            inner_script_escaped = shlex.quote(str(inner_script))
+            inner_content = f'''#!/bin/bash
 cd {shlex.quote(str(self.config.project_path))}
-script -q {log_file_path} /bin/bash -c '{cmd_with_task}; echo $? > {done_file_path}'
+TASK=$(cat {task_file_escaped})
+echo "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
+echo "🤖 BENDER → {self.WORKER_NAME}"
+echo "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
+echo ""
+echo "$TASK" | head -20
+echo ""
+echo "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
+echo ""
+{base_cmd} -p "$TASK"
+echo $? > {done_file_path}
+'''
+            inner_script.write_text(inner_content)
+            inner_script.chmod(0o755)
+            script_content = f'''#!/bin/bash
+script -q {log_file_path} {inner_script_escaped}
 '''
         elif self.WORKER_NAME == "droid":
             # droid exec работает одинаково для visible и background
-            task_file_escaped = shlex.quote(str(task_file))
             script_content = f'''#!/bin/bash
 cd {shlex.quote(str(self.config.project_path))}
 TASK=$(cat {task_file_escaped})
+echo "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
+echo "🤖 BENDER → droid"
+echo "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
+echo ""
+echo "$TASK" | head -20
+echo ""
+echo "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
+echo ""
 {cli_cmd} "$TASK" 2>&1 | tee {log_file_path}
 echo $? > {done_file_path}
 '''
         else:
             # codex и другие
-            task_file_escaped = shlex.quote(str(task_file))
             script_content = f'''#!/bin/bash
 cd {shlex.quote(str(self.config.project_path))}
 TASK=$(cat {task_file_escaped})
+echo "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
+echo "🤖 BENDER → {self.WORKER_NAME}"
+echo "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
+echo ""
+echo "$TASK" | head -20
+echo ""
+echo "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
+echo ""
 {cli_cmd} "$TASK" 2>&1 | tee {log_file_path}
 echo $? > {done_file_path}
 '''
@@ -514,57 +549,8 @@ echo $? > {done_file_path}
             logger.warning(f"[{self.WORKER_NAME}] Error capturing output: {e}")
             return ""
 
-    async def _send_text_to_terminal(self, text: str) -> bool:
-        """Отправить текст в нативный Terminal.app (macOS)"""
-        import sys
-        import json
-
-        if sys.platform != "darwin":
-            return False
-
-        window_id = getattr(self, "_terminal_window_id", None)
-        text_payload = json.dumps(text or "")
-
-        window_select = ""
-        if window_id:
-            window_select = f"""
-                try
-                    set front window to (first window whose id is {window_id})
-                end try
-            """
-
-        applescript = f'''
-        tell application "Terminal"
-            activate
-            {window_select}
-        end tell
-        tell application "System Events"
-            if {text_payload} is not "" then
-                keystroke {text_payload}
-            end if
-            key code 36
-        end tell
-        '''
-        try:
-            proc = await asyncio.create_subprocess_exec(
-                "osascript", "-e", applescript,
-                stdout=asyncio.subprocess.PIPE,
-                stderr=asyncio.subprocess.PIPE
-            )
-            await proc.wait()
-            return True
-        except Exception as e:
-            logger.warning(f"[{self.WORKER_NAME}] Native terminal input failed: {e}")
-            return False
-
     async def send_input(self, text: str) -> None:
         """Отправить ввод в tmux сессию"""
-        # Visible mode: попытаться отправить в нативный терминал (macOS)
-        if self.config.visible:
-            sent = await self._send_text_to_terminal(text)
-            if sent:
-                return
-
         try:
             process = await asyncio.create_subprocess_exec(
                 "tmux", "send-keys", "-t", self.session_id, text, "Enter",

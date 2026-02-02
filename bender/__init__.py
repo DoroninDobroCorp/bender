@@ -4,8 +4,7 @@ Bender supervises AI CLI tools (copilot, droid, codex) to complete tasks.
 It doesn't solve tasks itself, but ensures they are completed correctly.
 
 Modes:
-- Standard: copilot -p "task" (non-interactive)
-- Interactive: copilot in tmux session (full terminal, can continue manually)
+- Standard: copilot/droid/codex in tmux session
 - Review Loop: copilot → codex → copilot iterations
 
 Uses GLM (Cerebras zai-glm-4.7) as the supervisor LLM.
@@ -23,8 +22,6 @@ from .workers import (
     WorkerResult,
     CopilotWorker,
     TokenUsage,
-    InteractiveCopilotWorker,
-    CopilotState,
     DroidWorker,
     CodexWorker,
 )
@@ -51,8 +48,6 @@ __all__ = [
     "WorkerResult",
     "CopilotWorker",
     "TokenUsage",
-    "InteractiveCopilotWorker",
-    "CopilotState",
     "DroidWorker",
     "CodexWorker",
     "WorkerManager",

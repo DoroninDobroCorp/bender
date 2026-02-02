@@ -49,6 +49,7 @@ class LoopIteration:
     findings: List[Finding] = field(default_factory=list)
     decision: Optional[LoopDecision] = None
     fix_instructions: Optional[str] = None
+    had_changes: bool = False  # Были ли изменения в git
 
 
 @dataclass
@@ -166,7 +167,6 @@ class ReviewLoopManager:
         on_status: Optional[Callable[[str], Awaitable[None]]] = None,
         on_question: Optional[Callable[[str], Awaitable[Optional[str]]]] = None,
         use_copilot_reviewer: bool = False,
-        use_interactive: bool = False,  # Использовать интерактивный режим
         skip_llm: bool = False,  # Пропустить LLM анализ (simple mode)
         use_droid_mode: bool = False,  # Использовать droid для execution И review
         skip_first_execution: bool = False,  # Пропустить первое выполнение, сразу к ревью
@@ -176,13 +176,11 @@ class ReviewLoopManager:
         self.on_status = on_status
         self.on_question = on_question
         self.use_copilot_reviewer = use_copilot_reviewer
-        self.use_interactive = use_interactive
         self.skip_llm = skip_llm
         self.use_droid_mode = use_droid_mode
         self.skip_first_execution = skip_first_execution
         self.history: List[LoopIteration] = []
         self._stop_requested = False
-        self._interactive_worker: Optional[WorkerManager] = None  # Для интерактивного режима
         
         # Умный анализ логов
         self.log_filter = LogFilter()
@@ -210,6 +208,30 @@ class ReviewLoopManager:
         logger.info(f"[ReviewLoop] {message}")
         if self.on_status:
             await self.on_status(f"[Loop] {message}")
+    
+    async def _check_git_changes(self) -> bool:
+        """Проверить были ли изменения в git после последней итерации
+        
+        Смотрим git status - если есть modified/added/deleted файлы, значит были изменения.
+        """
+        try:
+            import asyncio
+            proc = await asyncio.create_subprocess_exec(
+                "git", "status", "--porcelain",
+                cwd=str(self.config.project_path),
+                stdout=asyncio.subprocess.PIPE,
+                stderr=asyncio.subprocess.PIPE,
+            )
+            stdout, _ = await proc.communicate()
+            # Если есть вывод - есть изменения
+            output = stdout.decode().strip()
+            if output:
+                logger.info(f"[ReviewLoop] Git changes detected: {len(output.splitlines())} files")
+                return True
+            return False
+        except Exception as e:
+            logger.warning(f"[ReviewLoop] Failed to check git status: {e}")
+            return False
     
     async def _clarify_task(self, task: str, skip_llm: bool = False) -> Optional[ClarifiedTask]:
         """Уточнить задачу через GLM
@@ -304,37 +326,45 @@ class ReviewLoopManager:
     def _detect_cycle(self) -> tuple:
         """Детекция бесконечного цикла
         
-        Проверяет последние 3 итерации на повторяющиеся паттерны.
+        Проверяет последние 3 итерации на повторяющиеся ошибки.
+        Цикл = одни и те же ошибки повторяются, copilot не может их исправить.
         
         Returns:
-            (is_cycle, reason)
+            (is_cycle, reason, repeating_issues)
         """
         if len(self.history) < 3:
-            return False, ""
+            return False, "", []
         
         # Берём последние 3 итерации
         last_3 = self.history[-3:]
         
-        # Проверяем повторяющиеся findings
+        # Собираем все findings как множества текстов ошибок
         findings_sets = []
         for iteration in last_3:
+            # Используем полный текст description для сравнения
             findings_key = frozenset(
-                (f.severity, f.description[:50]) 
+                f.description.strip().lower()
                 for f in iteration.findings
             )
             findings_sets.append(findings_key)
         
-        # Если все 3 итерации имеют одинаковые findings - цикл
-        if len(set(map(tuple, findings_sets))) == 1 and findings_sets[0]:
-            return True, f"Same {len(last_3[0].findings)} issues repeated 3 times"
+        # Ищем ошибки которые повторяются во всех 3 итерациях
+        if all(findings_sets):
+            common_errors = findings_sets[0]
+            for fs in findings_sets[1:]:
+                common_errors = common_errors & fs
+            
+            if common_errors:
+                # Есть повторяющиеся ошибки - это цикл
+                repeating = list(common_errors)[:5]  # Показываем до 5
+                return True, f"{len(common_errors)} issues keep repeating", repeating
         
-        # Если все 3 итерации имеют decision=FIX но findings не уменьшаются
-        all_fix = all(it.decision == LoopDecision.FIX for it in last_3)
-        findings_counts = [len(it.findings) for it in last_3]
-        if all_fix and findings_counts[0] <= findings_counts[-1]:
-            return True, f"Issues not decreasing: {findings_counts}"
+        # Если все 3 итерации имеют абсолютно одинаковые findings
+        if len(set(map(tuple, [sorted(fs) for fs in findings_sets]))) == 1 and findings_sets[0]:
+            repeating = [f.description for f in last_3[0].findings[:5]]
+            return True, f"Same {len(last_3[0].findings)} issues repeated 3 times", repeating
         
-        return False, ""
+        return False, "", []
     
     def _get_context_from_history(self, last_n: int = 3) -> str:
         """Получить контекст из последних N итераций
@@ -403,9 +433,15 @@ class ReviewLoopManager:
             iteration_num = i + 1
             
             # Проверка на цикл
-            is_cycle, cycle_reason = self._detect_cycle()
+            is_cycle, cycle_reason, repeating_issues = self._detect_cycle()
             if is_cycle:
                 await self._report(f"⚠️ Cycle detected: {cycle_reason}")
+                # Показываем какие именно ошибки не решаются
+                if repeating_issues:
+                    await self._report("🔄 Нерешаемые проблемы:")
+                    for issue in repeating_issues[:5]:
+                        issue_short = issue[:100] + "..." if len(issue) > 100 else issue
+                        await self._report(f"   • {issue_short}")
                 return ReviewLoopResult(
                     success=False,
                     iterations=iteration_num - 1,
@@ -439,9 +475,17 @@ class ReviewLoopManager:
                     task_with_context,
                     f"{execution_name}-iter-{iteration_num}"
                 )
+                # Краткий результат работы copilot
+                if copilot_output:
+                    await self._summarize_worker_output(execution_name, copilot_output)
             
             if self._stop_requested:
                 break
+            
+            # 1.5 Проверить были ли изменения в git ПОСЛЕ execution
+            had_changes = await self._check_git_changes()
+            if had_changes:
+                await self._report("📝 Changes detected in repository")
             
             # 2. Запустить review (droid, copilot или codex)
             await self._report(f"Running {self.reviewer_name} review...")
@@ -470,13 +514,24 @@ class ReviewLoopManager:
                 iteration=iteration_num,
                 worker=self.reviewer_name,
                 findings=findings,
+                had_changes=had_changes,  # из проверки после execution
             )
             
-            await self._report(f"Found {len(findings)} issues")
+            await self._report(f"Found {len(findings)} issues" + (", had changes" if had_changes else ", no changes"))
+            
+            # Выводим конкретные проблемы в терминал
+            for finding in findings[:5]:  # Максимум 5, чтобы не засорять
+                severity_emoji = {"CRITICAL": "🔴", "HIGH": "🟠", "MEDIUM": "🟡", "LOW": "🟢"}.get(finding.severity, "⚪")
+                loc = f" [{finding.location}]" if finding.location else ""
+                desc = finding.description[:80] + "..." if len(finding.description) > 80 else finding.description
+                await self._report(f"  {severity_emoji} {finding.severity}: {desc}{loc}")
+            if len(findings) > 5:
+                await self._report(f"  ... и ещё {len(findings) - 5} проблем")
             
             # 4. Спросить GLM что делать (или решить без GLM в simple mode)
             decision, fix_instructions = await self._analyze_findings(
-                task, findings, iteration_num, max_iter, skip_llm=skip_llm_analysis
+                task, findings, iteration_num, max_iter, skip_llm=skip_llm_analysis,
+                had_changes=had_changes
             )
             
             iteration.decision = decision
@@ -535,10 +590,6 @@ class ReviewLoopManager:
     ) -> str:
         """Запустить worker и дождаться результата"""
         
-        # Для интерактивного режима copilot - используем одну сессию
-        if self.use_interactive and worker_type == WorkerType.OPUS:
-            return await self._run_interactive_worker(task, session_suffix)
-        
         # Создаём LLM analyze callback для codex
         async def llm_analyze_callback(log: str, task_text: str, elapsed: float) -> dict:
             """LLM анализирует лог и решает статус"""
@@ -553,7 +604,7 @@ class ReviewLoopManager:
                 logger.debug(f"LLM analyze error: {e}")
                 return {"status": "working", "summary": "Анализ недоступен"}
         
-        # Обычный режим - создаём новый worker для каждой задачи
+        # Создаём новый worker для каждой задачи
         worker_manager = WorkerManager(
             config=self.config,
             on_output=None,
@@ -758,47 +809,52 @@ class ReviewLoopManager:
         except Exception:
             pass
     
-    async def _run_interactive_worker(self, task: str, session_suffix: str) -> str:
-        """Запустить задачу в интерактивном режиме
-        
-        Использует одну tmux сессию для всех задач в цикле.
-        Пользователь видит полноценный терминал.
-        """
-        # Создаём worker если ещё нет
-        if self._interactive_worker is None:
-            # Добавляем log_watcher в config для человеко-читаемых статусов
-            config_with_watcher = ManagerConfig(
-                project_path=self.config.project_path,
-                check_interval=self.config.check_interval,
-                visible=self.config.visible,
-                simple_mode=False,
-                max_retries=self.config.max_retries,
-                stuck_timeout=self.config.stuck_timeout,
-                interactive_mode=True,
-                status_interval=self.config.status_interval,
-                log_watcher=self.log_watcher if not self.skip_llm else None,
-            )
-            self._interactive_worker = WorkerManager(
-                config=config_with_watcher,
-                on_output=None,
-                on_status=self.on_status,
-                on_question=self.on_question,
-            )
-            await self._interactive_worker.start_task(task, WorkerType.OPUS_INTERACTIVE)
-        else:
-            # Отправляем следующую задачу в существующую сессию
-            await self._interactive_worker.send_next_task(task)
-        
-        # Ждём завершения
-        success, output = await self._interactive_worker.wait_for_completion(timeout=1800)
-        
-        return output
-    
     async def cleanup(self) -> None:
         """Очистка после завершения цикла"""
-        if self._interactive_worker:
-            await self._interactive_worker.stop()
-            self._interactive_worker = None
+        pass  # Ничего не нужно - каждый worker создаётся и удаляется отдельно
+    
+    async def _summarize_worker_output(self, worker_name: str, output: str) -> None:
+        """Вывести краткий результат работы worker'а"""
+        import re
+        
+        # Очистка от ANSI
+        clean = re.sub(r'\x1b\[[0-9;?]*[a-zA-Z]', '', output)
+        clean = re.sub(r'\x1b\][^\x07\x1b]*(?:\x07|\x1b\\)?', '', clean)
+        
+        # Ищем ключевые индикаторы
+        lines = clean.split('\n')
+        
+        # Собираем статистику
+        created = len(re.findall(r'(?:Created|Создан[оа]?)\s+\S+', clean, re.IGNORECASE))
+        updated = len(re.findall(r'(?:Updated|Обновлен[оа]?|Изменен[оа]?)\s+\S+', clean, re.IGNORECASE))
+        
+        # Ищем файлы
+        files = set(re.findall(r'[\w/.-]+\.(?:tsx?|jsx?|py|html|css|json|md|yaml|yml)', clean))
+        
+        # Формируем краткий результат
+        parts = []
+        if created:
+            parts.append(f"создано {created}")
+        if updated:
+            parts.append(f"изменено {updated}")
+        if files:
+            parts.append(f"файлов: {len(files)}")
+        
+        if parts:
+            await self._report(f"  📊 {worker_name} результат: {', '.join(parts)}")
+        
+        # Показываем последние значимые строки (не пустые, не TUI-мусор)
+        significant = []
+        for line in reversed(lines[-50:]):
+            line = line.strip()
+            if line and len(line) > 10 and not line.startswith(('─', '│', '╭', '╰', '┌', '└')):
+                if any(kw in line.lower() for kw in ['complete', 'done', 'success', 'error', 'fail', 'created', 'updated', 'ready']):
+                    significant.append(line[:80])
+                    if len(significant) >= 2:
+                        break
+        
+        for line in reversed(significant):
+            await self._report(f"  → {line}")
     
     def _parse_findings(self, codex_output: str) -> List[Finding]:
         """Парсить findings из вывода codex"""
@@ -842,10 +898,20 @@ class ReviewLoopManager:
         iteration: int,
         max_iterations: int,
         skip_llm: bool = False,
+        had_changes: bool = False,
     ) -> tuple[LoopDecision, Optional[str]]:
-        """Спросить GLM что делать с findings (или решить без GLM если skip_llm)"""
+        """Спросить GLM что делать с findings (или решить без GLM если skip_llm)
         
+        Логика: 
+        - Если были изменения → продолжать искать ошибки (даже если findings пуст)
+        - DONE только если: нет findings И не было изменений
+        """
+        
+        # Если были изменения, продолжаем даже без findings
         if not findings:
+            if had_changes:
+                logger.info("[ReviewLoop] No findings but changes detected - continue reviewing")
+                return LoopDecision.FIX, "Changes detected, verify they work correctly"
             return LoopDecision.DONE, None
         
         # Simple mode — без GLM, решаем по severity

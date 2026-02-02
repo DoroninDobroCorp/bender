@@ -110,7 +110,7 @@ class CopilotWorker(BaseWorker):
     def __init__(
         self, 
         config: WorkerConfig, 
-        model: str = "claude-sonnet-4", 
+        model: str = "claude-opus-4.5", 
         visible: bool = False,
         llm_analyze: Optional[Callable[[str, str, float], Awaitable[dict]]] = None,
     ):
@@ -167,6 +167,10 @@ class CopilotWorker(BaseWorker):
         # Форматируем задачу (это также устанавливает _pending_task для cli_command)
         formatted_task = self.format_task(task, context)
         logger.info(f"[{self.WORKER_NAME}] Starting: {task[:50]}...")
+        
+        # Логируем полный промпт для отладки (первые 500 символов)
+        prompt_preview = formatted_task[:500] + "..." if len(formatted_task) > 500 else formatted_task
+        logger.debug(f"[{self.WORKER_NAME}] Full prompt preview:\n{prompt_preview}")
         
         if self.visible:
             # Visible mode - используем native Terminal.app (как droid)
@@ -272,9 +276,14 @@ class CopilotWorker(BaseWorker):
             return False, str(e)
     
     async def _wait_visible(self, timeout: float) -> Tuple[bool, str]:
-        """Дождаться завершения в visible mode — LLM решает когда готово"""
+        """Дождаться завершения в visible mode
+        
+        Проверяем .done файл каждые 5 секунд — это самый надёжный способ.
+        """
         start = asyncio.get_event_loop().time()
-        check_interval = 30  # LLM проверка каждые 30 секунд
+        check_interval = 5  # Проверка .done файла каждые 5 секунд
+        llm_interval = 60   # LLM анализ каждые 60 секунд
+        last_llm_check = 0
         current_output = ""
         
         while asyncio.get_event_loop().time() - start < timeout:
@@ -290,7 +299,21 @@ class CopilotWorker(BaseWorker):
             else:
                 current_output = ""
             
-            # 1. Детекция по паттернам (быстрая, без LLM)
+            # 1. САМЫЙ НАДЁЖНЫЙ: проверяем .done файл напрямую
+            done_file = getattr(self, '_done_file', None)
+            if done_file and done_file.exists():
+                try:
+                    exit_code = int(done_file.read_text().strip())
+                    self._completed = True
+                    self._output = current_output
+                    self.status = WorkerStatus.COMPLETED
+                    self.token_usage = self._parse_token_usage(self._output)
+                    logger.info(f"[{self.WORKER_NAME}] Done file found, exit code: {exit_code}")
+                    return exit_code == 0, self._output
+                except (ValueError, IOError):
+                    pass
+            
+            # 2. Детекция по паттернам (быстрая, без LLM)
             completion_reason = self.detect_completion(current_output)
             if completion_reason:
                 self._completed = True
@@ -300,7 +323,7 @@ class CopilotWorker(BaseWorker):
                 logger.info(f"[{self.WORKER_NAME}] Completed: {completion_reason}")
                 return True, self._output
             
-            # 2. Детекция зависания
+            # 3. Детекция зависания
             if self.detect_stuck(current_output):
                 logger.warning(f"[{self.WORKER_NAME}] Stuck detected (no output change)")
                 self._completed = True
@@ -308,18 +331,9 @@ class CopilotWorker(BaseWorker):
                 self.status = WorkerStatus.STUCK
                 return False, self._output
             
-            # 3. Проверяем жива ли сессия
-            session_alive = await self.is_session_alive()
-            if not session_alive:
-                self._completed = True
-                self._output = current_output
-                self.status = WorkerStatus.COMPLETED
-                self.token_usage = self._parse_token_usage(self._output)
-                logger.info(f"[{self.WORKER_NAME}] Session closed, completed")
-                return True, self._output
-            
-            # 4. LLM анализ (если есть)
-            if self._llm_analyze and len(current_output) > 100:
+            # 4. LLM анализ (если есть) — только каждые 60 секунд
+            if self._llm_analyze and len(current_output) > 100 and elapsed - last_llm_check >= llm_interval:
+                last_llm_check = elapsed
                 try:
                     analysis = await self._llm_analyze(
                         current_output[-6000:],

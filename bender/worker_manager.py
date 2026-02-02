@@ -12,7 +12,6 @@ from typing import Optional, Dict, Type, Callable, Awaitable, List
 
 from .workers.base import BaseWorker, WorkerConfig, WorkerStatus, WorkerResult
 from .workers.copilot import CopilotWorker
-from .workers.interactive_copilot import InteractiveCopilotWorker
 from .workers.droid import DroidWorker
 from .workers.codex import CodexWorker
 from .glm_client import clean_surrogates
@@ -90,15 +89,13 @@ def cleanup_stale_bender_sessions() -> List[str]:
 
 class WorkerType(str, Enum):
     """Типы workers"""
-    OPUS = "opus"                    # copilot с opus (default, -p режим)
-    OPUS_INTERACTIVE = "opus_interactive"  # copilot интерактивный (новый!)
+    OPUS = "opus"                    # copilot (tmux session)
     DROID = "droid"                  # droid для простых задач
     CODEX = "codex"                  # codex для сложных задач
 
 
 WORKER_CLASSES: Dict[WorkerType, Type[BaseWorker]] = {
     WorkerType.OPUS: CopilotWorker,
-    WorkerType.OPUS_INTERACTIVE: InteractiveCopilotWorker,
     WorkerType.DROID: DroidWorker,
     WorkerType.CODEX: CodexWorker,
 }
@@ -113,9 +110,8 @@ class ManagerConfig:
     simple_mode: bool = False
     max_retries: int = 3
     stuck_timeout: float = 300.0
-    interactive_mode: bool = False  # Использовать интерактивный copilot
-    status_interval: float = 30.0   # Интервал статуса для интерактивного режима
-    log_watcher: Optional[object] = None  # LogWatcher для человеко-читаемых статусов
+    status_interval: float = 30.0
+    log_watcher: Optional[object] = None  # LogWatcher для статусов
 
 
 class WorkerManager:
@@ -185,17 +181,6 @@ class WorkerManager:
                 worker_config, 
                 visible=self.config.visible,
                 llm_analyze=self._llm_analyze,
-            )
-        
-        # Для InteractiveCopilotWorker передаём все callback'и
-        if worker_type == WorkerType.OPUS_INTERACTIVE:
-            return worker_class(
-                worker_config,
-                on_status=self.on_status,
-                on_question=self.on_question,
-                auto_allow_tools=True,  # Автоматически разрешаем tools
-                status_interval=self.config.status_interval,
-                log_watcher=self.config.log_watcher,  # Для человеко-читаемых статусов
             )
         
         # Для DroidWorker передаём LLM callbacks
