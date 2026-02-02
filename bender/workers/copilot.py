@@ -49,6 +49,154 @@ def cleanup_copilot_state() -> None:
             logger.warning(f"[copilot] Failed to clear command-history: {e}")
 
 
+def cleanup_orphaned_processes() -> dict:
+    """Убить orphaned copilot/codex/droid процессы и закрыть окна
+    
+    Ищет и убивает:
+    - Старые copilot процессы (старше 1 часа без активности)
+    - Старые codex процессы
+    - Bash обертки bender-run-*
+    - Закрывает orphaned Terminal окна
+    
+    Returns:
+        dict с информацией о cleanup
+    """
+    import subprocess
+    import time
+    
+    killed_processes = []
+    closed_windows = []
+    
+    # 1. Убиваем старые copilot процессы (старше 1 часа)
+    try:
+        result = subprocess.run(
+            ["ps", "-eo", "pid,etime,command"],
+            capture_output=True,
+            text=True,
+            timeout=5
+        )
+        
+        if result.returncode == 0:
+            for line in result.stdout.split('\n'):
+                if 'copilot' in line and '--allow-all' in line:
+                    parts = line.strip().split(None, 2)
+                    if len(parts) >= 3:
+                        pid = parts[0]
+                        etime = parts[1]
+                        
+                        # Парсим elapsed time (формат: [[dd-]hh:]mm:ss)
+                        try:
+                            time_parts = etime.split(':')
+                            if len(time_parts) >= 2:
+                                # Если больше часа - убиваем
+                                if '-' in etime or (len(time_parts) >= 3 and int(time_parts[0]) >= 1):
+                                    subprocess.run(["kill", "-9", pid], timeout=2)
+                                    killed_processes.append(f"copilot (PID {pid}, uptime {etime})")
+                                    logger.info(f"Killed orphaned copilot process: PID {pid}")
+                        except (ValueError, IndexError):
+                            pass
+    except Exception as e:
+        logger.warning(f"Error cleaning copilot processes: {e}")
+    
+    # 2. Убиваем старые codex процессы
+    try:
+        result = subprocess.run(
+            ["pgrep", "-f", "codex exec"],
+            capture_output=True,
+            text=True,
+            timeout=5
+        )
+        
+        if result.returncode == 0:
+            pids = result.stdout.strip().split('\n')
+            for pid in pids:
+                if pid.strip():
+                    try:
+                        subprocess.run(["kill", "-9", pid.strip()], timeout=2)
+                        killed_processes.append(f"codex (PID {pid.strip()})")
+                        logger.info(f"Killed orphaned codex process: PID {pid.strip()}")
+                    except Exception:
+                        pass
+    except Exception as e:
+        logger.warning(f"Error cleaning codex processes: {e}")
+    
+    # 3. Убиваем bash обертки bender-run-*
+    try:
+        result = subprocess.run(
+            ["pgrep", "-f", "bender-run-"],
+            capture_output=True,
+            text=True,
+            timeout=5
+        )
+        
+        if result.returncode == 0:
+            pids = result.stdout.strip().split('\n')
+            for pid in pids:
+                if pid.strip():
+                    try:
+                        subprocess.run(["kill", "-9", pid.strip()], timeout=2)
+                        killed_processes.append(f"bender-run (PID {pid.strip()})")
+                        logger.info(f"Killed orphaned bender-run process: PID {pid.strip()}")
+                    except Exception:
+                        pass
+    except Exception as e:
+        logger.warning(f"Error cleaning bender-run processes: {e}")
+    
+    # 4. Закрываем orphaned Terminal окна (только на macOS)
+    try:
+        import sys
+        if sys.platform == "darwin":
+            # Ищем окна Terminal с "BENDER" в названии
+            script = '''
+            tell application "Terminal"
+                set windowList to {}
+                repeat with w in windows
+                    try
+                        set wName to name of w
+                        if wName contains "BENDER" or wName contains "bender" then
+                            set end of windowList to id of w
+                        end if
+                    end try
+                end repeat
+                return windowList
+            end tell
+            '''
+            
+            result = subprocess.run(
+                ["osascript", "-e", script],
+                capture_output=True,
+                text=True,
+                timeout=5
+            )
+            
+            if result.returncode == 0 and result.stdout.strip():
+                window_ids = result.stdout.strip().split(', ')
+                for wid in window_ids:
+                    if wid.strip():
+                        close_script = f'''
+                        tell application "Terminal"
+                            try
+                                close (first window whose id is {wid.strip()}) saving no
+                            end try
+                        end tell
+                        '''
+                        try:
+                            subprocess.run(["osascript", "-e", close_script], timeout=2)
+                            closed_windows.append(f"Terminal window {wid.strip()}")
+                            logger.info(f"Closed orphaned Terminal window: {wid.strip()}")
+                        except Exception:
+                            pass
+    except Exception as e:
+        logger.warning(f"Error closing Terminal windows: {e}")
+    
+    return {
+        "killed_processes": killed_processes,
+        "closed_windows": closed_windows,
+        "total_killed": len(killed_processes),
+        "total_closed": len(closed_windows)
+    }
+
+
 @dataclass
 class TokenUsage:
     """Статистика использования токенов"""

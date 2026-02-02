@@ -227,6 +227,11 @@ class BaseWorker(ABC):
         import tempfile
         from pathlib import Path
         
+        # ВАЖНО: Убиваем старые процессы с тем же session_id перед запуском
+        # Это предотвращает дублирование при restart
+        logger.info(f"[{self.WORKER_NAME}] Pre-start cleanup for session {self.session_id}")
+        await self._cleanup_session_processes()
+        
         # Создаём лог-файл и done-маркер
         self._log_file = Path(tempfile.gettempdir()) / f"{self.session_id}.log"
         self._done_file = Path(tempfile.gettempdir()) / f"{self.session_id}.done"
@@ -447,8 +452,12 @@ echo $? > {done_file_path}
             # Visible mode: закрыть нативный терминал
             await self._close_native_terminal()
         else:
-            # Background mode: убить tmux сессию
+            # Background mode: убить tmux сессию И все связанные процессы
             try:
+                # Сначала убиваем все процессы связанные с сессией
+                await self._cleanup_session_processes()
+                
+                # Потом убиваем tmux сессию
                 process = await asyncio.create_subprocess_exec(
                     "tmux", "kill-session", "-t", self.session_id,
                     stdout=asyncio.subprocess.PIPE,
@@ -461,34 +470,79 @@ echo $? > {done_file_path}
         self.status = WorkerStatus.IDLE
         self.current_task = None
     
+    async def _cleanup_session_processes(self) -> None:
+        """Убить ВСЕ процессы связанные с session_id
+        
+        Ищет и убивает:
+        - bash обертки (bender-run-*.sh)
+        - script процессы
+        - tee процессы
+        - дочерние процессы (codex, copilot, droid)
+        """
+        try:
+            # Ищем ВСЕ процессы содержащие session_id
+            find_proc = await asyncio.create_subprocess_shell(
+                f"pgrep -f '{self.session_id}'",
+                stdout=asyncio.subprocess.PIPE,
+                stderr=asyncio.subprocess.DEVNULL
+            )
+            stdout, _ = await find_proc.communicate()
+            
+            if stdout:
+                pids = [p.strip() for p in stdout.decode().strip().split('\n') if p.strip().isdigit()]
+                if pids:
+                    logger.info(f"[{self.WORKER_NAME}] Killing {len(pids)} session processes: {', '.join(pids)}")
+                    
+                    # Сначала пробуем SIGTERM (graceful)
+                    for pid in pids:
+                        try:
+                            kill_proc = await asyncio.create_subprocess_exec(
+                                "kill", "-15", pid,
+                                stdout=asyncio.subprocess.DEVNULL,
+                                stderr=asyncio.subprocess.DEVNULL
+                            )
+                            await kill_proc.wait()
+                        except Exception:
+                            pass
+                    
+                    # Даём время на graceful shutdown
+                    await asyncio.sleep(0.5)
+                    
+                    # Проверяем что осталось и убиваем SIGKILL
+                    check_proc = await asyncio.create_subprocess_shell(
+                        f"pgrep -f '{self.session_id}'",
+                        stdout=asyncio.subprocess.PIPE,
+                        stderr=asyncio.subprocess.DEVNULL
+                    )
+                    stdout, _ = await check_proc.communicate()
+                    
+                    if stdout:
+                        remaining_pids = [p.strip() for p in stdout.decode().strip().split('\n') if p.strip().isdigit()]
+                        if remaining_pids:
+                            logger.info(f"[{self.WORKER_NAME}] Force killing {len(remaining_pids)} remaining processes")
+                            for pid in remaining_pids:
+                                try:
+                                    kill_proc = await asyncio.create_subprocess_exec(
+                                        "kill", "-9", pid,
+                                        stdout=asyncio.subprocess.DEVNULL,
+                                        stderr=asyncio.subprocess.DEVNULL
+                                    )
+                                    await kill_proc.wait()
+                                except Exception:
+                                    pass
+        except Exception as e:
+            logger.warning(f"[{self.WORKER_NAME}] Error cleaning up processes: {e}")
+    
     async def _close_native_terminal(self) -> None:
         """Закрыть нативное окно терминала"""
         import sys
         import tempfile
         
+        # Убиваем ВСЕ процессы сессии
+        await self._cleanup_session_processes()
+        
         if sys.platform == "darwin":
             window_id = getattr(self, '_terminal_window_id', None)
-            
-            # Сначала убиваем процесс script если он ещё работает
-            try:
-                find_proc = await asyncio.create_subprocess_shell(
-                    f"pgrep -f 'script.*{self.session_id}'",
-                    stdout=asyncio.subprocess.PIPE,
-                    stderr=asyncio.subprocess.DEVNULL
-                )
-                stdout, _ = await find_proc.communicate()
-                if stdout:
-                    pids = stdout.decode().strip().split('\n')
-                    for pid in pids:
-                        if pid.isdigit():
-                            kill_proc = await asyncio.create_subprocess_exec(
-                                "kill", "-9", pid,
-                                stdout=asyncio.subprocess.DEVNULL,
-                                stderr=asyncio.subprocess.DEVNULL
-                            )
-                            await kill_proc.wait()
-            except Exception:
-                pass
             
             await asyncio.sleep(0.3)
             
@@ -516,13 +570,14 @@ echo $? > {done_file_path}
                 logger.warning(f"[{self.WORKER_NAME}] No window_id saved, cannot close terminal safely")
         
         # Удалить временные файлы
-        for pattern in ["bender-task-", "bender-run-", "bender-winid-", "bender-"]:
+        for pattern in ["bender-task-", "bender-run-", "bender-winid-", "bender-inner-", "bender-"]:
             temp_file = Path(tempfile.gettempdir()) / f"{pattern}{self.session_id}"
-            for suffix in ["", ".txt", ".sh", ".log"]:
+            for suffix in ["", ".txt", ".sh", ".log", ".done"]:
                 f = Path(str(temp_file) + suffix)
                 if f.exists():
                     try:
                         f.unlink()
+                        logger.debug(f"[{self.WORKER_NAME}] Deleted temp file: {f.name}")
                     except Exception:
                         pass
     
