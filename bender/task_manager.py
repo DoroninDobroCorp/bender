@@ -201,6 +201,7 @@ class TaskManager:
         self._accumulated_log = ""
         self._nudge_count = 0
         self._console_recovery.reset()
+        self.log_watcher.reset()  # Reset stuck detection timer for new task
         
         start_time = asyncio.get_event_loop().time()
         
@@ -511,6 +512,7 @@ class TaskManager:
                 raw_log=raw_log,
                 task=self._current_task,
                 elapsed_seconds=elapsed,
+                process_alive=session_alive,  # Сообщаем что процесс ещё работает
             )
             
             await self._report_status(f"[{analysis.result.value}] {analysis.summary}")

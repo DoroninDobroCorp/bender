@@ -519,14 +519,12 @@ class ReviewLoopManager:
             
             await self._report(f"Found {len(findings)} issues" + (", had changes" if had_changes else ", no changes"))
             
-            # Выводим конкретные проблемы в терминал
-            for finding in findings[:5]:  # Максимум 5, чтобы не засорять
+            # Выводим ВСЕ проблемы в терминал (для удобного копирования)
+            for finding in findings:  # Показываем все, не обрезаем
                 severity_emoji = {"CRITICAL": "🔴", "HIGH": "🟠", "MEDIUM": "🟡", "LOW": "🟢"}.get(finding.severity, "⚪")
                 loc = f" [{finding.location}]" if finding.location else ""
-                desc = finding.description[:80] + "..." if len(finding.description) > 80 else finding.description
-                await self._report(f"  {severity_emoji} {finding.severity}: {desc}{loc}")
-            if len(findings) > 5:
-                await self._report(f"  ... и ещё {len(findings) - 5} проблем")
+                # Не обрезаем description - показываем полностью для удобного копирования
+                await self._report(f"  {severity_emoji} {finding.severity}: {finding.description}{loc}")
             
             # 4. Спросить GLM что делать (или решить без GLM в simple mode)
             decision, fix_instructions = await self._analyze_findings(
@@ -594,7 +592,8 @@ class ReviewLoopManager:
         async def llm_analyze_callback(log: str, task_text: str, elapsed: float) -> dict:
             """LLM анализирует лог и решает статус"""
             try:
-                analysis = await self.log_watcher.analyze(log, task_text, elapsed)
+                # process_alive=True по умолчанию - callback вызывается пока процесс работает
+                analysis = await self.log_watcher.analyze(log, task_text, elapsed, process_alive=True)
                 return {
                     "status": analysis.result.value,
                     "summary": analysis.summary,
@@ -676,7 +675,8 @@ class ReviewLoopManager:
                                 # Если нет прогресса — пробуем GLM (если не simple mode)
                                 if not self.skip_llm:
                                     try:
-                                        analysis = await self.log_watcher.analyze(output, task, elapsed)
+                                        # process_alive=True - мы в цикле пока worker работает
+                                        analysis = await self.log_watcher.analyze(output, task, elapsed, process_alive=True)
                                         summary = analysis.summary
                                         # Выводим полный статус на нескольких строках
                                         await self._report(f"⏳ [{elapsed}s] Статус:")

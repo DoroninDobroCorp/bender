@@ -471,13 +471,8 @@ class CopilotWorker(BaseWorker):
                 logger.info(f"[{self.WORKER_NAME}] Completed: {completion_reason}")
                 return True, self._output
             
-            # 3. Детекция зависания
-            if self.detect_stuck(current_output):
-                logger.warning(f"[{self.WORKER_NAME}] Stuck detected (no output change)")
-                self._completed = True
-                self._output = current_output
-                self.status = WorkerStatus.STUCK
-                return False, self._output
+            # 3. НЕ проверяем stuck здесь - полагаемся на .done файл и timeout
+            # Copilot может долго думать без вывода, это нормально
             
             # 4. LLM анализ (если есть) — только каждые 60 секунд
             if self._llm_analyze and len(current_output) > 100 and elapsed - last_llm_check >= llm_interval:

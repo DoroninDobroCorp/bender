@@ -55,7 +55,8 @@ class LogWatcher:
     """
     
     # Таймаут "зависания" в секундах
-    STUCK_TIMEOUT_SECONDS = 300  # 5 минут без изменений
+    # 10 минут - достаточно для долгих задач, LLM может думать долго
+    STUCK_TIMEOUT_SECONDS = 600  # 10 минут без изменений
     CHECK_INTERVAL = 30  # Интервал проверок
     
     ANALYSIS_PROMPT = """Ты наблюдатель за AI-ассистентом. Определи статус работы.
@@ -105,29 +106,48 @@ class LogWatcher:
         self,
         raw_log: str,
         task: str,
-        elapsed_seconds: float
+        elapsed_seconds: float,
+        process_alive: bool = True  # Процесс ещё работает?
     ) -> WatcherAnalysis:
         """Анализ лога
         
         LLM вызывается ТОЛЬКО при:
-        1. Зависании (300s без изменений)
+        1. Зависании (600s без изменений) И процесс НЕ активен
         2. Паттерн показал completion (для подтверждения)
+        
+        Args:
+            raw_log: Сырой лог
+            task: Текст задачи
+            elapsed_seconds: Время с начала задачи
+            process_alive: True если процесс (copilot/droid) ещё работает
         """
         
         # Обрезаем лог
         trimmed_log = self.context.tail_log(raw_log)
         
+        logger.debug(f"[LogWatcher] Analyzing: raw_len={len(raw_log)}, elapsed={elapsed_seconds:.0f}s, process_alive={process_alive}")
+        
         # Проверяем copilot completion ПЕРЕД фильтрацией (filter убирает "Type @")
         copilot_result = self._check_copilot_completion(trimmed_log)
         if copilot_result:
+            logger.debug(f"[LogWatcher] Copilot completion detected")
             return copilot_result
         
         # Фильтруем шум
         filtered = self.filter.filter(trimmed_log)
         log_content = filtered.model_messages
         
-        # Слишком короткий - ждём
+        logger.debug(f"[LogWatcher] Filtered: raw={filtered.raw_length}, filtered={filtered.filtered_length}")
+        
+        # Слишком короткий - ждём, но обновляем время чтобы не застрять
         if filtered.filtered_length < 50:
+            # Если raw лог меняется - всё ещё работаем, обновляем время
+            raw_hash = hashlib.md5(raw_log[-1000:].encode() if len(raw_log) > 1000 else raw_log.encode()).hexdigest()
+            if raw_hash != self._last_log_hash:
+                self._last_log_hash = raw_hash
+                self._last_log_time = time.time()
+                self._no_change_count = 0
+                logger.debug(f"[LogWatcher] Short log but raw changed - resetting timer")
             return WatcherAnalysis(
                 result=AnalysisResult.WORKING,
                 summary="Модель начала работу",
@@ -142,8 +162,11 @@ class LogWatcher:
             self._last_log_hash = current_hash
             self._last_log_time = time.time()
             self._no_change_count = 0
+            logger.debug(f"[LogWatcher] Log changed - resetting timer")
         else:
             self._no_change_count += 1
+            stuck_seconds = time.time() - self._last_log_time
+            logger.debug(f"[LogWatcher] Log unchanged for {stuck_seconds:.0f}s (count={self._no_change_count})")
         
         # 1. ВСЕГДА проверяем паттерны (бесплатно)
         pattern_result = self._analyze_by_patterns(log_content)
@@ -161,12 +184,22 @@ class LogWatcher:
             elif pattern_result.result == AnalysisResult.NEED_HUMAN:
                 return pattern_result
         
-        # 2. Проверяем зависание (300 секунд без изменений)
+        # 2. Проверяем зависание (только если процесс НЕ активен или очень долго нет изменений)
         stuck_seconds = time.time() - self._last_log_time
         is_stuck = stuck_seconds >= self.STUCK_TIMEOUT_SECONDS
         
+        # Если процесс активен - НЕ считаем это stuck, просто ждём
+        # Copilot/droid могут долго думать без вывода в лог
+        if process_alive and is_stuck:
+            logger.info(f"[LogWatcher] No log changes for {stuck_seconds:.0f}s but process is alive - continuing to wait")
+            return WatcherAnalysis(
+                result=AnalysisResult.WORKING,
+                summary=f"Процесс работает ({stuck_seconds:.0f}s без вывода)",
+                suggestion=None,
+            )
+        
         if is_stuck:
-            logger.warning(f"[LogWatcher] No log changes for {stuck_seconds:.0f}s - calling LLM")
+            logger.warning(f"[LogWatcher] No log changes for {stuck_seconds:.0f}s and process not alive - calling LLM")
             # Вызываем LLM чтобы понять что случилось
             try:
                 analysis = await self._analyze_with_glm(log_content, task, elapsed_seconds)
