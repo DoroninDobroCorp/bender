@@ -110,8 +110,10 @@ class ManagerConfig:
     simple_mode: bool = False
     max_retries: int = 3
     stuck_timeout: float = 300.0
+    max_total_timeout: float = 28800.0  # 8 часов
     status_interval: float = 30.0
     log_watcher: Optional[object] = None  # LogWatcher для статусов
+    ssh_host: Optional[str] = None  # SSH host для удалённого запуска
 
 
 class WorkerManager:
@@ -171,6 +173,7 @@ class WorkerManager:
             simple_mode=self.config.simple_mode,
             max_retries=self.config.max_retries,
             stuck_timeout=self.config.stuck_timeout,
+            ssh_host=self.config.ssh_host,
         )
         
         worker_class = WORKER_CLASSES[worker_type]
@@ -339,6 +342,12 @@ class WorkerManager:
             output = await self._current_worker.capture_output()
             return clean_surrogates(output)
         return ""
+    
+    def get_worker_status(self) -> str:
+        """Получить статус worker'а (для диагностики причины ошибки)"""
+        if self._current_worker:
+            return self._current_worker.status.value
+        return "idle"
     
     async def get_status(self) -> Dict:
         """Получить текущий статус"""

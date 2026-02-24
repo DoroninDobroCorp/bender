@@ -50,13 +50,16 @@ def cleanup_copilot_state() -> None:
 
 
 def cleanup_orphaned_processes() -> dict:
-    """Убить orphaned copilot/codex/droid процессы и закрыть окна
+    """Убить orphaned BENDER процессы (ТОЛЬКО связанные с bender!)
+    
+    ВАЖНО: Убиваем ТОЛЬКО процессы с "bender" в командной строке или путях!
+    НЕ трогаем обычные copilot/codex процессы пользователя.
     
     Ищет и убивает:
-    - Старые copilot процессы (старше 1 часа без активности)
-    - Старые codex процессы
-    - Bash обертки bender-run-*
-    - Закрывает orphaned Terminal окна
+    - Старые bender-run-* bash обертки
+    - script процессы запущенные bender (PTY leak fix!)
+    - bender-inner-* скрипты
+    - Закрывает orphaned Terminal окна с "BENDER" в названии
     
     Returns:
         dict с информацией о cleanup
@@ -67,93 +70,92 @@ def cleanup_orphaned_processes() -> dict:
     killed_processes = []
     closed_windows = []
     
-    # 1. Убиваем старые copilot процессы (старше 1 часа)
+    # 0. Убиваем старые bender tmux сессии
     try:
         result = subprocess.run(
-            ["ps", "-eo", "pid,etime,command"],
+            ["tmux", "list-sessions", "-F", "#{session_name}"],
+            capture_output=True,
+            text=True,
+            timeout=5
+        )
+        if result.returncode == 0:
+            for session in result.stdout.strip().split('\n'):
+                if session.startswith('bender-'):
+                    try:
+                        subprocess.run(["tmux", "kill-session", "-t", session], timeout=2)
+                        killed_processes.append(f"tmux:{session}")
+                        logger.info(f"Killed orphaned tmux session: {session}")
+                    except Exception:
+                        pass
+    except Exception:
+        pass  # tmux может быть не запущен
+    
+    # 1. Убиваем bender-run-* и bender-inner-* bash обертки
+    for pattern in ["bender-run-", "bender-inner-", "bender-task-"]:
+        try:
+            result = subprocess.run(
+                ["pgrep", "-f", pattern],
+                capture_output=True,
+                text=True,
+                timeout=5
+            )
+            
+            if result.returncode == 0:
+                pids = result.stdout.strip().split('\n')
+                for pid in pids:
+                    if pid.strip():
+                        try:
+                            subprocess.run(["kill", "-9", pid.strip()], timeout=2)
+                            killed_processes.append(f"{pattern} (PID {pid.strip()})")
+                            logger.info(f"Killed orphaned {pattern} process: PID {pid.strip()}")
+                        except Exception:
+                            pass
+        except Exception as e:
+            logger.warning(f"Error cleaning {pattern} processes: {e}")
+    
+    # 2. КРИТИЧНО: Убиваем script процессы которые держат PTY (только bender-related!)
+    # Ищем script процессы которые запущены с bender session ID
+    try:
+        # Получаем все script процессы с их командной строкой
+        result = subprocess.run(
+            ["ps", "-eo", "pid,command"],
             capture_output=True,
             text=True,
             timeout=5
         )
         
         if result.returncode == 0:
-            for line in result.stdout.split('\n'):
-                if 'copilot' in line and '--allow-all' in line:
-                    parts = line.strip().split(None, 2)
-                    if len(parts) >= 3:
+            for line in result.stdout.strip().split('\n'):
+                # Ищем script процессы связанные с bender
+                # Проверяем: bender- в пути, /tmp/bender, или /var/folders/.../bender-
+                if 'script' in line and ('bender-' in line or '/tmp/bender' in line or 'bender-droid' in line or 'bender-copilot' in line or 'bender-codex' in line):
+                    parts = line.strip().split(None, 1)
+                    if parts and parts[0].isdigit():
                         pid = parts[0]
-                        etime = parts[1]
-                        
-                        # Парсим elapsed time (формат: [[dd-]hh:]mm:ss)
                         try:
-                            time_parts = etime.split(':')
-                            if len(time_parts) >= 2:
-                                # Если больше часа - убиваем
-                                if '-' in etime or (len(time_parts) >= 3 and int(time_parts[0]) >= 1):
-                                    subprocess.run(["kill", "-9", pid], timeout=2)
-                                    killed_processes.append(f"copilot (PID {pid}, uptime {etime})")
-                                    logger.info(f"Killed orphaned copilot process: PID {pid}")
-                        except (ValueError, IndexError):
+                            subprocess.run(["kill", "-9", pid], timeout=2)
+                            killed_processes.append(f"script (PID {pid})")
+                            logger.info(f"Killed orphaned script process: PID {pid}")
+                        except Exception:
                             pass
     except Exception as e:
-        logger.warning(f"Error cleaning copilot processes: {e}")
+        logger.warning(f"Error cleaning script processes: {e}")
     
-    # 2. Убиваем старые codex процессы
-    try:
-        result = subprocess.run(
-            ["pgrep", "-f", "codex exec"],
-            capture_output=True,
-            text=True,
-            timeout=5
-        )
-        
-        if result.returncode == 0:
-            pids = result.stdout.strip().split('\n')
-            for pid in pids:
-                if pid.strip():
-                    try:
-                        subprocess.run(["kill", "-9", pid.strip()], timeout=2)
-                        killed_processes.append(f"codex (PID {pid.strip()})")
-                        logger.info(f"Killed orphaned codex process: PID {pid.strip()}")
-                    except Exception:
-                        pass
-    except Exception as e:
-        logger.warning(f"Error cleaning codex processes: {e}")
-    
-    # 3. Убиваем bash обертки bender-run-*
-    try:
-        result = subprocess.run(
-            ["pgrep", "-f", "bender-run-"],
-            capture_output=True,
-            text=True,
-            timeout=5
-        )
-        
-        if result.returncode == 0:
-            pids = result.stdout.strip().split('\n')
-            for pid in pids:
-                if pid.strip():
-                    try:
-                        subprocess.run(["kill", "-9", pid.strip()], timeout=2)
-                        killed_processes.append(f"bender-run (PID {pid.strip()})")
-                        logger.info(f"Killed orphaned bender-run process: PID {pid.strip()}")
-                    except Exception:
-                        pass
-    except Exception as e:
-        logger.warning(f"Error cleaning bender-run processes: {e}")
-    
-    # 4. Закрываем orphaned Terminal окна (только на macOS)
+    # 2. Закрываем orphaned Terminal окна ТОЛЬКО с точными bender паттернами (только на macOS)
+    # ВАЖНО: НЕ закрываем окна просто содержащие "bender" - только специфичные bender окна!
     try:
         import sys
         if sys.platform == "darwin":
-            # Ищем окна Terminal с "BENDER" в названии
+            # Ищем окна Terminal ТОЛЬКО с точными bender паттернами
+            # "BENDER →" - visible mode header
+            # "bender-run-" или "bender-droid-" - session scripts
             script = '''
             tell application "Terminal"
                 set windowList to {}
                 repeat with w in windows
                     try
                         set wName to name of w
-                        if wName contains "BENDER" or wName contains "bender" then
+                        if wName contains "BENDER →" or wName contains "bender-run-" or wName contains "bender-droid-" or wName contains "bender-copilot-" or wName contains "bender-codex-" then
                             set end of windowList to id of w
                         end if
                     end try
@@ -258,7 +260,7 @@ class CopilotWorker(BaseWorker):
     def __init__(
         self, 
         config: WorkerConfig, 
-        model: str = "claude-opus-4.5", 
+        model: str = "claude-opus-4.6", 
         visible: bool = False,
         llm_analyze: Optional[Callable[[str, str, float], Awaitable[dict]]] = None,
     ):
@@ -299,6 +301,16 @@ class CopilotWorker(BaseWorker):
             full_task = task
         self._pending_task = full_task
         return full_task
+
+    def _create_streaming_adapter(self):
+        """CopilotWorker использует GenericStreamingAdapter из base.py.
+
+        Returns:
+            GenericStreamingAdapter для plain text output
+        """
+        from .base import GenericStreamingAdapter
+
+        return GenericStreamingAdapter(agent_type="copilot")
     
     async def start(self, task: str, context: Optional[str] = None) -> None:
         """Запустить copilot с задачей
@@ -317,7 +329,10 @@ class CopilotWorker(BaseWorker):
         logger.info(f"[{self.WORKER_NAME}] Starting: {task[:50]}...")
         
         # Логируем полный промпт для отладки (первые 500 символов)
+        # Очищаем surrogates чтобы избежать UnicodeEncodeError в логах
+        from backend.services.bender.glm_client import clean_surrogates
         prompt_preview = formatted_task[:500] + "..." if len(formatted_task) > 500 else formatted_task
+        prompt_preview = clean_surrogates(prompt_preview)
         logger.debug(f"[{self.WORKER_NAME}] Full prompt preview:\n{prompt_preview}")
         
         if self.visible:
@@ -330,16 +345,30 @@ class CopilotWorker(BaseWorker):
             await self._start_background(cmd)
     
     async def _start_background(self, cmd: List[str]) -> None:
-        """Запустить в фоне через subprocess"""
+        """Запустить в фоне через subprocess (локально или через SSH)"""
         try:
-            logger.info(f"[{self.WORKER_NAME}] Running: {' '.join(cmd)}")
-            logger.info(f"[{self.WORKER_NAME}] CWD: {self.config.project_path}")
-            self._process = await asyncio.create_subprocess_exec(
-                *cmd,
-                cwd=str(self.config.project_path),
-                stdout=asyncio.subprocess.PIPE,
-                stderr=asyncio.subprocess.STDOUT,
-            )
+            if self.config.ssh_host:
+                # Remote execution via SSH
+                import shlex
+                remote_cmd = f"cd {shlex.quote(str(self.config.project_path))} && {' '.join(shlex.quote(c) for c in cmd)}"
+                final_cmd = ["ssh", "-o", "BatchMode=yes", "-o", "StrictHostKeyChecking=no", self.config.ssh_host, remote_cmd]
+                logger.info(f"[{self.WORKER_NAME}] Remote SSH: {self.config.ssh_host}:{self.config.project_path}")
+                logger.info(f"[{self.WORKER_NAME}] Running: {' '.join(final_cmd[:4])}...")
+                self._process = await asyncio.create_subprocess_exec(
+                    *final_cmd,
+                    stdout=asyncio.subprocess.PIPE,
+                    stderr=asyncio.subprocess.STDOUT,
+                )
+            else:
+                # Local execution
+                logger.info(f"[{self.WORKER_NAME}] Running: {' '.join(cmd)}")
+                logger.info(f"[{self.WORKER_NAME}] CWD: {self.config.project_path}")
+                self._process = await asyncio.create_subprocess_exec(
+                    *cmd,
+                    cwd=str(self.config.project_path),
+                    stdout=asyncio.subprocess.PIPE,
+                    stderr=asyncio.subprocess.STDOUT,
+                )
             logger.info(f"[{self.WORKER_NAME}] Process started (PID: {self._process.pid})")
         except Exception as e:
             logger.error(f"[{self.WORKER_NAME}] Failed to start: {e}")
@@ -348,6 +377,16 @@ class CopilotWorker(BaseWorker):
     
     async def capture_output(self) -> str:
         """Захватить вывод от copilot"""
+        # Visible mode - читаем из лог-файла
+        if self.visible:
+            if self._log_file is not None and self._log_file.exists():
+                try:
+                    return self._log_file.read_text(errors='replace')
+                except Exception:
+                    pass
+            return self._output
+        
+        # Background mode - читаем из process stdout
         if self._process is None:
             return self._output
         
@@ -388,6 +427,13 @@ class CopilotWorker(BaseWorker):
     async def wait_for_completion(self, timeout: float = 300) -> Tuple[bool, str]:
         """Дождаться завершения copilot
         
+        Non-visible mode: activity-based timeout.
+        Убиваем только если вывод не менялся inactivity_timeout секунд.
+        Общий лимит — max_total_timeout (дефолт 8ч).
+        
+        Args:
+            timeout: inactivity timeout (сколько секунд тишины = зависание)
+        
         Returns:
             Tuple[success, output]
         """
@@ -398,26 +444,84 @@ class CopilotWorker(BaseWorker):
         if self._process is None:
             return False, ""
         
+        inactivity_timeout = timeout  # 300s по умолчанию
+        max_total = getattr(self.config, 'max_total_timeout', 28800.0)
+        check_interval = 5.0  # Проверяем каждые 5 секунд
+        
+        start_time = asyncio.get_event_loop().time()
+        last_output_len = 0
+        last_activity_time = start_time
+        
         try:
-            stdout, _ = await asyncio.wait_for(
-                self._process.communicate(),
-                timeout=timeout
-            )
-            self._output = stdout.decode('utf-8', errors='replace') if stdout else ""
-            self._completed = True
-            self.status = WorkerStatus.COMPLETED
-            
-            # Парсим статистику токенов
-            self.token_usage = self._parse_token_usage(self._output)
-            if self.token_usage:
-                logger.info(f"[{self.WORKER_NAME}] {self.token_usage}")
-            
-            logger.info(f"[{self.WORKER_NAME}] Completed with {len(self._output)} chars output")
-            return True, self._output
-        except asyncio.TimeoutError:
-            logger.warning(f"[{self.WORKER_NAME}] Timeout after {timeout}s")
-            self.status = WorkerStatus.STUCK
-            return False, self._output
+            while True:
+                now = asyncio.get_event_loop().time()
+                elapsed = now - start_time
+                inactive_for = now - last_activity_time
+                
+                # Проверяем общий таймаут (8ч)
+                if elapsed >= max_total:
+                    logger.warning(f"[{self.WORKER_NAME}] Max total timeout {max_total}s reached")
+                    self.status = WorkerStatus.STUCK
+                    return False, self._output
+                
+                # Проверяем inactivity таймаут
+                if inactive_for >= inactivity_timeout:
+                    logger.warning(
+                        f"[{self.WORKER_NAME}] Inactivity timeout: no output for "
+                        f"{int(inactive_for)}s (limit {int(inactivity_timeout)}s), "
+                        f"total elapsed {int(elapsed)}s"
+                    )
+                    self.status = WorkerStatus.STUCK
+                    return False, self._output
+                
+                # Проверяем: процесс завершился?
+                if self._process.returncode is not None:
+                    # Процесс вышел — собираем оставшийся stdout
+                    remaining = b""
+                    if self._process.stdout:
+                        try:
+                            remaining = await asyncio.wait_for(
+                                self._process.stdout.read(), timeout=2.0
+                            )
+                        except (asyncio.TimeoutError, Exception):
+                            pass
+                    if remaining:
+                        self._output += remaining.decode('utf-8', errors='replace')
+                    
+                    self._completed = True
+                    self.status = WorkerStatus.COMPLETED
+                    self.token_usage = self._parse_token_usage(self._output)
+                    if self.token_usage:
+                        logger.info(f"[{self.WORKER_NAME}] {self.token_usage}")
+                    logger.info(
+                        f"[{self.WORKER_NAME}] Completed with {len(self._output)} chars "
+                        f"output in {int(elapsed)}s"
+                    )
+                    return True, self._output
+                
+                # Читаем stdout chunk (non-blocking)
+                if self._process.stdout:
+                    try:
+                        chunk = await asyncio.wait_for(
+                            self._process.stdout.read(8192),
+                            timeout=check_interval,
+                        )
+                        if chunk:
+                            self._output += chunk.decode('utf-8', errors='replace')
+                        elif self._process.returncode is not None:
+                            # EOF + process exited — следующая итерация обработает
+                            continue
+                    except asyncio.TimeoutError:
+                        pass
+                else:
+                    await asyncio.sleep(check_interval)
+                
+                # Отслеживаем активность
+                current_len = len(self._output)
+                if current_len != last_output_len:
+                    last_output_len = current_len
+                    last_activity_time = asyncio.get_event_loop().time()
+                
         except Exception as e:
             logger.error(f"[{self.WORKER_NAME}] Error waiting: {e}")
             self.status = WorkerStatus.ERROR
@@ -452,11 +556,29 @@ class CopilotWorker(BaseWorker):
             if done_file and done_file.exists():
                 try:
                     exit_code = int(done_file.read_text().strip())
+                    # ВАЖНО: ждём пока лог перестанет расти (tee дописывает)
+                    # Читаем несколько раз с интервалом пока размер стабилизируется
+                    last_size = 0
+                    stable_count = 0
+                    for _ in range(10):  # max 5 секунд (10 * 0.5)
+                        await asyncio.sleep(0.5)
+                        if self._log_file is not None and self._log_file.exists():
+                            current_output = self._log_file.read_text(errors='replace')
+                            current_size = len(current_output)
+                            if current_size == last_size:
+                                stable_count += 1
+                                if stable_count >= 2:  # 2 раза подряд одинаковый размер
+                                    break
+                            else:
+                                stable_count = 0
+                                last_size = current_size
+                    
+                    logger.info(f"[{self.WORKER_NAME}] Log stabilized at {len(current_output)} chars after {stable_count} stable reads")
                     self._completed = True
                     self._output = current_output
                     self.status = WorkerStatus.COMPLETED
                     self.token_usage = self._parse_token_usage(self._output)
-                    logger.info(f"[{self.WORKER_NAME}] Done file found, exit code: {exit_code}")
+                    logger.info(f"[{self.WORKER_NAME}] Done file found, exit code: {exit_code}, output: {len(self._output)} chars")
                     return exit_code == 0, self._output
                 except (ValueError, IOError):
                     pass

@@ -149,14 +149,21 @@ class TaskClarifier:
                 f"Предлагаемые критерии приёмки:\n{criteria_text}\n\nОдобрить? (да/нет/свои)"
             )
             
-            approval_lower = approval.lower().strip()
-            if approval_lower in ["нет", "no", "n", "без критериев"]:
+            # Убираем пунктуацию и лишние символы для проверки
+            import re
+            approval_clean = re.sub(r'[^\w\s]', '', approval.lower()).strip()
+            
+            if approval_clean in ["нет", "no", "n", "без критериев"]:
                 logger.info("[Clarifier] User rejected criteria - sending without them")
                 criteria = []
-            elif approval_lower not in ["да", "yes", "y", "ок", "ok", ""]:
-                # Пользователь ввёл свои критерии
-                logger.info("[Clarifier] User provided custom criteria")
-                criteria = [c.strip() for c in approval.split("\n") if c.strip()]
+            elif approval_clean not in ["да", "yes", "y", "ок", "ok", ""]:
+                # Пользователь ввёл свои критерии (не просто согласие)
+                # Дополнительная проверка - если это очень короткий ответ, скорее всего это согласие
+                if len(approval_clean) <= 3:
+                    logger.info(f"[Clarifier] Short response '{approval}' treated as approval")
+                else:
+                    logger.info("[Clarifier] User provided custom criteria")
+                    criteria = [c.strip() for c in approval.split("\n") if c.strip()]
         
         # Парсим результат
         complexity_str = result.get("complexity", "MEDIUM").upper()

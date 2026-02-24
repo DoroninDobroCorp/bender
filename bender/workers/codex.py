@@ -77,6 +77,16 @@ class CodexWorker(BaseWorker):
         if context:
             formatted += f"\n\nКонтекст:\n{context}"
         return formatted
+
+    def _create_streaming_adapter(self):
+        """CodexWorker использует GenericStreamingAdapter из base.py.
+
+        Returns:
+            GenericStreamingAdapter для plain text output
+        """
+        from .base import GenericStreamingAdapter
+
+        return GenericStreamingAdapter(agent_type="codex")
     
     async def wait_for_completion(self, timeout: float = 1800) -> tuple:
         """Дождаться завершения
@@ -140,7 +150,7 @@ class CodexWorker(BaseWorker):
                 last_output_len = len(current_output)
         
         # Таймаут
-        self._output = current_output if 'current_output' in dir() else ""
+        self._output = current_output
         self.status = WorkerStatus.TIMEOUT
         logger.warning(f"[{self.WORKER_NAME}] Timeout after {timeout}s")
         return False, self._output

@@ -18,9 +18,9 @@ from .gemini_client import GeminiClient, GeminiKeyRotator
 
 logger = logging.getLogger(__name__)
 
-# Модели
-CEREBRAS_MODEL = "qwen-3-235b-a22b-instruct-2507"
-GEMINI_MODEL = "gemini-3-flash-preview"  # Gemini 3 Flash для fallback
+# ⛔ НЕ МЕНЯЙ МОДЕЛИ БЕЗ ПРОВЕРКИ curl! См. gemini_client.py
+CEREBRAS_MODEL = "zai-glm-4.7"  # Проверено 2026-02-04 - доступна для всех ключей
+GEMINI_MODEL = "gemini-3-flash-preview"  # Gemini 3 Flash - проверено 2026-02-03
 
 
 class KeyRotator:

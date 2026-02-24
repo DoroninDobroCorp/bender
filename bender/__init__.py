@@ -35,7 +35,7 @@ from .context_manager import ContextManager, ContextBudget
 # Task management
 from .task_clarifier import TaskClarifier, TaskComplexity, ClarifiedTask
 from .task_manager import TaskManager, TaskState, TaskResult
-from .review_loop import ReviewLoopManager, ReviewLoopResult, LoopDecision
+from .review import ReviewLoopManager, ReviewLoopResult
 
 __all__ = [
     # Core - GLM + Qwen fallback
@@ -70,5 +70,4 @@ __all__ = [
     "TaskResult",
     "ReviewLoopManager",
     "ReviewLoopResult",
-    "LoopDecision",
 ]

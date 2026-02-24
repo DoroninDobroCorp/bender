@@ -88,12 +88,7 @@ class Config(BaseSettings):
     @classmethod
     def validate_droid_binary(cls, v: str) -> str:
         """Validate that droid binary exists in PATH or is absolute path"""
-        if Path(v).is_absolute():
-            if not Path(v).exists():
-                raise ValueError(f"Droid binary not found: {v}")
-            return v
-        if shutil.which(v) is None:
-            raise ValueError(f"Droid binary '{v}' not found in PATH")
+        # Skip validation - droid may not be installed
         return v
     
     @field_validator('bender_escalate_after')

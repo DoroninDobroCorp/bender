@@ -9,6 +9,7 @@ Log Watcher - мониторинг и анализ логов CLI workers
 
 import asyncio
 import hashlib
+import json
 import logging
 import time
 from dataclasses import dataclass
@@ -101,7 +102,31 @@ class LogWatcher:
     def _compute_hash(self, log: str) -> str:
         """Быстрый хеш лога"""
         return hashlib.md5(log.encode()[:5000]).hexdigest()
-    
+
+    def _safe_read_ndjson_lines(self, content: str) -> list[str]:
+        """Безопасное чтение NDJSON строк (защита от race conditions)
+
+        Читаем только полные строки JSON. Если последняя строка битая
+        (файл ещё дописывается), игнорируем её - прочитаем в следующий раз.
+
+        Это предотвращает JSONDecodeError при параллельном чтении/записи.
+        """
+        valid_lines = []
+        for raw_line in content.split("\n"):
+            stripped = raw_line.strip()
+            if not stripped:
+                continue
+            try:
+                # Пытаемся парсить. Если успешно - строка записана полностью
+                # Если это огрызок (пол-строки) - json.loads упадет
+                json.loads(stripped)
+                valid_lines.append(stripped)
+            except json.JSONDecodeError:
+                # Игнорируем битую строку (дочитаем в след раз)
+                pass
+        return valid_lines
+
+
     async def analyze(
         self,
         raw_log: str,

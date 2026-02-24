@@ -1,3 +1,0 @@
-"""
-Parser Maker Test Suite
-"""

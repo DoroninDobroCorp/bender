@@ -1,33 +1,74 @@
+#!/usr/bin/env python3
 """
 Bender CLI - AI Task Supervisor
 
-Bender не решает задачи сам, а следит за их выполнением через CLI инструменты
-(copilot, droid, codex).
-
-Команды:
-- bender run "задача" - выполнить задачу (default: opus mode)
-- bender run --droid "задача" - простая задача через droid
-- bender run --codex "задача" - сложная задача через codex
-- bender status - текущий статус
-- bender attach - присоединиться к терминалу
-
-Параметры:
-- --interval N / --N - интервал проверки логов (default: 60s)
-- --simple - без перепроверки результата
-- --visible - показать терминалы
-- --project PATH - путь к проекту
 """
 
 import asyncio
+import atexit
+import os
 import signal
+import subprocess
 import sys
 from pathlib import Path
 from typing import Optional
 
 import click
 
+BENDER_ROOT = Path(__file__).parent.parent
+if str(BENDER_ROOT) not in sys.path:
+    sys.path.insert(0, str(BENDER_ROOT))
+
 from core.config import load_config
 from core.logging_config import setup_logging
+
+
+def _should_run_global_cleanup() -> bool:
+    """Return True if it's safe to kill global bender processes.
+
+    Skips cleanup when running in parallel to avoid killing other sessions.
+    """
+    if os.getenv("BENDER_ALLOW_PARALLEL", "").lower() in ("1", "true", "yes"):
+        return False
+    if os.getenv("BENDER_SKIP_GLOBAL_CLEANUP", "").lower() in ("1", "true", "yes"):
+        return False
+    try:
+        patterns = ["bmad-bender run", "bender run"]
+        current_pid = os.getpid()
+        for pattern in patterns:
+            result = subprocess.run(
+                ["pgrep", "-f", pattern],
+                capture_output=True,
+                text=True,
+                timeout=2
+            )
+            if result.returncode == 0:
+                pids = [int(p) for p in result.stdout.split() if p.isdigit()]
+                if any(pid != current_pid for pid in pids):
+                    return False
+    except Exception:
+        # If detection fails, keep old behavior
+        return True
+    return True
+
+
+def _atexit_cleanup():
+    """Cleanup при выходе из bender - убиваем зависшие процессы"""
+    if not _should_run_global_cleanup():
+        return
+    try:
+        from bender.workers.copilot import cleanup_orphaned_processes
+        result = cleanup_orphaned_processes()
+        if result.get("total_killed", 0) > 0 or result.get("total_closed", 0) > 0:
+            # Печатаем только если что-то почистили
+            sys.stderr.write(f"\n🧹 Bender cleanup: killed {result.get('total_killed', 0)} processes, closed {result.get('total_closed', 0)} windows\n")
+    except Exception:
+        pass  # Тихо игнорируем ошибки при cleanup
+
+
+# NOTE: atexit cleanup регистрируется в group callback (Story 48.4),
+# чтобы не срабатывать при import (для lazy loading из lev bender).
+_atexit_registered = False
 
 
 def clean_surrogates(text: str) -> str:
@@ -89,35 +130,49 @@ def bender_echo(message: str) -> None:
 
 
 def handle_shutdown(signum, frame):
-    """Handle Ctrl+C"""
+    """Handle Ctrl+C - cleanup processes before exit"""
     if _task_manager:
         _task_manager.request_stop()
     if _shutdown_event:
         _shutdown_event.set()
-    click.echo("\n⚠️  Stopping...")
+    click.echo("\n⚠️  Stopping and cleaning up...")
+    
+    # Сразу запускаем cleanup
+    if _should_run_global_cleanup():
+        try:
+            from bender.workers.copilot import cleanup_orphaned_processes
+            cleanup_orphaned_processes()
+        except Exception:
+            pass
+    
     # Force exit on second Ctrl+C
     signal.signal(signal.SIGINT, lambda s, f: sys.exit(1))
 
 
-@click.group()
+@click.group(context_settings=dict(help_option_names=['-h', '--help']))
 @click.option('--debug', is_flag=True, help='Enable debug logging')
 @click.pass_context
 def cli(ctx, debug):
-    """Bender - AI Task Supervisor
-    
+    """Bender - AI Task Supervisor.
+
     Supervises AI tools (copilot, droid, codex) to complete your tasks.
-    
+
     \b
     Examples:
-        bender run "Add OAuth authentication"
-        bender run --droid "Fix typo in README"
-        bender run --codex "Find memory leak in worker.py"
-        bender run --interval 10 "Quick fix"
-        bender status
-        bender attach
+        lev bender run "Add OAuth authentication"
+        lev bender run --droid "Fix typo in README"
+        lev bender run --codex "Find memory leak in worker.py"
+        lev bender status
+        lev bender attach
     """
+    global _atexit_registered
     ctx.ensure_object(dict)
     ctx.obj['debug'] = debug
+
+    # Register atexit cleanup only when bender is actually used
+    if not _atexit_registered:
+        atexit.register(_atexit_cleanup)
+        _atexit_registered = True
 
 
 @cli.command()
@@ -131,13 +186,14 @@ def cli(ctx, debug):
 @click.option('--visible', '-v', is_flag=True, help='Show terminal windows (tmux)')
 @click.option('--review-loop', '-l', is_flag=True, help='Iterative copilot→codex loop until clean')
 @click.option('--copilot-review', '-c', is_flag=True, help='Use copilot instead of codex for review (saves codex limits)')
-@click.option('--droid-mode', '-d', is_flag=True, help='Use droid (Sonnet) for BOTH execution and review - faster & cheaper!')
+@click.option('--droid-mode', '-d', count=True, help='Use droid: -d = execution only, -dd = execution AND review (fastest!)')
+@click.option('--party', '-P', is_flag=True, help='BMAD Party 10-role scoring (98+ threshold)')
 @click.option('--max-iterations', type=int, default=10, help='Max iterations for review loop')
 @click.option('--continue-errors', '-C', type=str, default=None, help='Continue mode: comma-separated errors to fix first')
 @click.option('--errors-interactive', '-E', is_flag=True, help='Enter errors interactively (line by line)')
 @click.option('--project', '-p', type=click.Path(exists=True), help='Project path')
 @click.pass_context
-def run(ctx, task, droid, opus, codex, auto, interval, simple, visible, review_loop, copilot_review, droid_mode, max_iterations, continue_errors, errors_interactive, project):
+def run(ctx, task, droid, opus, codex, auto, interval, simple, visible, review_loop, copilot_review, droid_mode, party, max_iterations, continue_errors, errors_interactive, project):
     """Run a task with Bender supervision
     
     TASK can be omitted - Bender will ask interactively.
@@ -152,19 +208,24 @@ def run(ctx, task, droid, opus, codex, auto, interval, simple, visible, review_l
     Use --droid or --codex to force a specific worker.
     Use --review-loop for iterative copilot→codex→copilot cycle.
     Use --copilot-review (-c) with --review-loop to use copilot for review.
-    Use --droid-mode (-d) to use droid (Sonnet) for BOTH execution and review - faster!
+    Use -d for droid execution (codex review), -dd for FULL DROID (droid-droid) - fastest!
     Use -E to enter errors interactively, or -C "errors" to pass directly.
     Use -v to show tmux terminal windows.
     
     Examples:
         bender run "Add OAuth authentication"
         bender run -lv               # Loop with visible terminal
-        bender run -lvc              # Loop with copilot review
-        bender run -lvd              # Loop with droid (faster!)
+        bender run -lvc              # Loop with copilot review  
+        bender run -lvd              # Loop: droid exec, codex review
+        bender run -lvdd             # Loop: droid-droid (FASTEST!)
+        bender run -lvP              # Loop with BMAD Party scoring (10 roles)
+        bender run -lvdP             # Droid exec + BMAD Party review
         bender run -lvE              # Loop + errors interactive
         bender run -lvc -C "bug1, bug2" "task"
     """
-    
+    # Deprecation warning (Story 50.2)
+    click.echo('⚠️  Deprecated: use `lev -l "task"` instead of `lev bender run "task"`', err=True)
+
     # Interactive mode: ask for task if not provided
     if task is None:
         click.echo(BENDER_ASCII)
@@ -246,7 +307,7 @@ def run(ctx, task, droid, opus, codex, auto, interval, simple, visible, review_l
     
     # Логи хранятся в папке bender (внутри пакета bender)
     from pathlib import Path
-    import bender
+    from backend.services import bender
     bender_pkg_dir = Path(bender.__file__).parent
     log_dir = bender_pkg_dir / "logs"
     log_dir.mkdir(exist_ok=True)
@@ -266,10 +327,37 @@ def run(ctx, task, droid, opus, codex, auto, interval, simple, visible, review_l
     else:
         worker_type = None  # Auto-select
     
+    # droid_mode теперь count: 0=off, 1=exec only, 2+=droid-droid
+    use_droid_exec = droid_mode >= 1
+    use_droid_review = droid_mode >= 2
+    
+    # КРИТИЧНО: Cleanup orphaned процессов от предыдущих запусков
+    # Это предотвращает PTY exhaustion (pty_posix_spawn failed)
+    if _should_run_global_cleanup():
+        try:
+            from bender.workers.copilot import cleanup_orphaned_processes
+            cleanup_result = cleanup_orphaned_processes()
+            if cleanup_result.get('total_killed', 0) > 0 or cleanup_result.get('total_closed', 0) > 0:
+                click.echo(f"🧹 Cleaned up {cleanup_result.get('total_killed', 0)} orphaned processes, {cleanup_result.get('total_closed', 0)} windows")
+        except Exception:
+            pass
+    else:
+        click.echo("ℹ️  Skipping global cleanup (parallel Bender session detected)")
+    
     click.echo(f"🤖 Bender starting...")
     if review_loop:
-        reviewer = "copilot" if copilot_review else "codex"
-        click.echo(f"   Mode: REVIEW LOOP (copilot→{reviewer}→copilot, max {max_iterations} iterations)")
+        if use_droid_review:
+            reviewer = "droid"
+            executor = "droid"
+            click.echo(f"   Mode: DROID-DROID LOOP 🚀 (fastest! max {max_iterations} iterations)")
+        elif use_droid_exec:
+            executor = "droid"
+            reviewer = "copilot" if copilot_review else "codex"
+            click.echo(f"   Mode: REVIEW LOOP ({executor}→{reviewer}, max {max_iterations} iterations)")
+        else:
+            executor = "copilot"
+            reviewer = "copilot" if copilot_review else "codex"
+            click.echo(f"   Mode: REVIEW LOOP ({executor}→{reviewer}, max {max_iterations} iterations)")
         if continue_errors:
             click.echo(f"   Continue mode: will fix initial errors first")
         elif review_first_mode:
@@ -318,12 +406,12 @@ def run(ctx, task, droid, opus, codex, auto, interval, simple, visible, review_l
     
     if review_loop:
         # Review loop mode
-        asyncio.run(_run_review_loop(task, max_iterations, visible, project, copilot_review, droid_mode, initial_errors, ctx.obj.get('debug', False), review_first_mode, interval, simple))
+        asyncio.run(_run_review_loop(task, max_iterations, visible, project, copilot_review, use_droid_exec, use_droid_review, initial_errors, ctx.obj.get('debug', False), review_first_mode, interval, simple, party))
     else:
         asyncio.run(_run_task(task, worker_type, interval, simple, visible, project, ctx.obj.get('debug', False)))
 
 
-async def _run_review_loop(task: str, max_iterations: int, visible: bool, project_path: Optional[str], use_copilot_reviewer: bool = False, use_droid_mode: bool = False, initial_errors: Optional[list] = None, debug: bool = False, skip_first_execution: bool = False, status_interval: int = 60, skip_llm_analysis: bool = False):
+async def _run_review_loop(task: str, max_iterations: int, visible: bool, project_path: Optional[str], use_copilot_reviewer: bool = False, use_droid_exec: bool = False, use_droid_review: bool = False, initial_errors: Optional[list] = None, debug: bool = False, skip_first_execution: bool = False, status_interval: int = 60, skip_llm_analysis: bool = False, use_party_mode: bool = False):
     """Run iterative review loop: worker → reviewer → worker
     
     Args:
@@ -332,7 +420,8 @@ async def _run_review_loop(task: str, max_iterations: int, visible: bool, projec
         visible: Show terminal windows (tmux)
         project_path: Path to project
         use_copilot_reviewer: Use copilot instead of codex for review
-        use_droid_mode: Use droid (Sonnet) for BOTH execution and review
+        use_droid_exec: Use droid for execution (-d)
+        use_droid_review: Use droid for review too (-dd)
         initial_errors: List of initial errors for continue mode
         debug: Enable debug output
         skip_first_execution: Skip first execution, go straight to review
@@ -355,7 +444,7 @@ async def _run_review_loop(task: str, max_iterations: int, visible: bool, projec
     proj_path = Path(project_path) if project_path else Path.cwd()
     
     from bender.llm_router import LLMRouter
-    from bender.review_loop import ReviewLoopManager
+    from bender.review import ReviewLoopManager
     from bender.worker_manager import ManagerConfig
     
     # Use multiple API keys if available
@@ -379,8 +468,12 @@ async def _run_review_loop(task: str, max_iterations: int, visible: bool, projec
         return response
     
     # Определяем режим
-    if use_droid_mode:
-        click.echo("🤖 Mode: DROID (Sonnet) for both execution and review")
+    if use_party_mode:
+        click.echo("🎉 Mode: BMAD Party (10-role scoring, threshold 98+)")
+    elif use_droid_review:
+        click.echo("🚀 Mode: DROID-DROID (fastest! droid for both execution and review)")
+    elif use_droid_exec:
+        click.echo("🤖 Mode: DROID execution + codex/copilot review")
     
     loop_manager = ReviewLoopManager(
         llm=llm,
@@ -389,7 +482,9 @@ async def _run_review_loop(task: str, max_iterations: int, visible: bool, projec
         on_question=on_ask_user,
         use_copilot_reviewer=use_copilot_reviewer,
         skip_llm=skip_llm_analysis,
-        use_droid_mode=use_droid_mode,
+        use_droid_exec=use_droid_exec,
+        use_droid_review=use_droid_review,
+        use_party_mode=use_party_mode,
         skip_first_execution=skip_first_execution,
     )
     
@@ -398,6 +493,7 @@ async def _run_review_loop(task: str, max_iterations: int, visible: bool, projec
             task, 
             max_iterations=max_iterations,
             skip_llm_analysis=skip_llm_analysis,
+            initial_errors=initial_errors,
         )
         
         click.echo()
@@ -648,8 +744,86 @@ def attach(ctx):
     subprocess.run(['tmux', 'attach-session', '-t', session])
 
 
+@cli.command()
+@click.pass_context
+def cleanup(ctx):
+    """Clean up orphaned Bender processes and terminals
+    
+    Use this if Bender crashed and left processes running,
+    or if you see 'PTY not available' errors.
+    
+    This command:
+    - Kills bender-run-*, bender-inner-* scripts
+    - Kills script processes that hold PTYs
+    - Closes Terminal windows with "BENDER" in title
+    - Kills stale tmux sessions
+    """
+    click.echo("🧹 Cleaning up Bender processes...")
+    
+    import subprocess
+    
+    # 1. Cleanup orphaned processes
+    try:
+        from bender.workers.copilot import cleanup_orphaned_processes
+        result = cleanup_orphaned_processes()
+        click.echo(f"   Killed processes: {result.get('total_killed', 0)}")
+        click.echo(f"   Closed windows: {result.get('total_closed', 0)}")
+        if result.get('killed_processes'):
+            for p in result['killed_processes'][:5]:
+                click.echo(f"      - {p}")
+    except Exception as e:
+        click.echo(f"   ⚠️ Error cleaning processes: {e}")
+    
+    # 2. Kill stale tmux sessions
+    try:
+        from bender.worker_manager import cleanup_stale_bender_sessions
+        killed = cleanup_stale_bender_sessions()
+        click.echo(f"   Killed tmux sessions: {len(killed)}")
+        for s in killed[:5]:
+            click.echo(f"      - {s}")
+    except Exception as e:
+        click.echo(f"   ⚠️ Error cleaning tmux: {e}")
+    
+    # 3. Force kill any remaining script processes with bender
+    try:
+        result = subprocess.run(
+            ["ps", "-eo", "pid,command"],
+            capture_output=True,
+            text=True,
+            timeout=5
+        )
+        if result.returncode == 0:
+            killed_extra = 0
+            for line in result.stdout.strip().split('\n'):
+                if 'script' in line.lower() and ('bender' in line.lower() or '/tmp/bender' in line):
+                    parts = line.strip().split(None, 1)
+                    if parts and parts[0].isdigit():
+                        try:
+                            subprocess.run(["kill", "-9", parts[0]], timeout=2)
+                            killed_extra += 1
+                        except Exception:
+                            pass
+            if killed_extra:
+                click.echo(f"   Extra script processes killed: {killed_extra}")
+    except Exception:
+        pass
+    
+    click.echo("✅ Cleanup complete!")
+
+
 def main():
-    """Entry point"""
+    """Entry point (legacy — use `lev bender` instead)."""
+    import warnings
+    warnings.warn(
+        "Use "bender" command directly.",
+        DeprecationWarning,
+        stacklevel=2,
+    )
+    click.echo(click.style(
+        "⚠️  Use "bender" command directly.",
+        fg="yellow",
+    ))
+
     # Handle --N shorthand for --interval N
     args = sys.argv[1:]
     new_args = []
@@ -659,7 +833,7 @@ def main():
         else:
             new_args.append(arg)
     sys.argv[1:] = new_args
-    
+
     cli(obj={})
 
 
